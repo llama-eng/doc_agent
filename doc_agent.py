@@ -58,36 +58,258 @@ import csv
 
 # Initialize Langfuse CallbackHandler for Langchain (tracing)
 langfuse_handler = CallbackHandler()
-
-
-def compare_documents(extracted_file_contents: list):
-    print("---------STRATED---------")
-
+#Initialize the llm as openai based api from ollama cloud models
+llm = ChatOpenAI(
+    model="gpt-oss:120b",
+    api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+    base_url="https://ollama.com/v1",
+    # temperature=0,
+    # max_tokens=None,
+    # timeout=None,
+    # max_retries=2,
+    # organization="...",
+    # other params...
+)
     
-    # raw_text_1 = extracted_file_contents[0][0]
-    # raw_text_2 = extracted_file_contents[0][1]
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-    # doc_1 = Document(page_content=raw_text_1, metadata={"source": "manual_input_1"})
-    # doc_2 = Document(page_content=raw_text_2, metadata={"source": "manual_input_2", "author": "User"})
+################################################ 1 Core Functionalities of a Document Comparison Agent ######################################################
+        
+# ----------------------------------------------------------------------------
+# 1.1 Make Chunks
+# ----------------------------------------------------------------------------
+def split_creation(all_docs) -> dict:
+    """
+    Input:
+        all_docs : langchain document object
+    Output:
+        splits : dict  
+            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]}
+    """
 
-    # documents = [doc_1, doc_2]
+    print("---------Splits Creation---------")
+    all_docs_splits = {}
 
-    #Initialize the llm as openai based api from ollama cloud models
-    llm = ChatOpenAI(
-        model="gpt-oss:120b",
-        api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
-        base_url="https://ollama.com/v1",
-        # temperature=0,
-        # max_tokens=None,
-        # timeout=None,
-        # max_retries=2,
-        # organization="...",
-        # other params...
-    )
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    print("---------LLM/Embeddings Initialized---------")
-    #Get the documents
-    folder_path = "/home/tharaka/thakshana/doc_comparison/data"  # folder containing all your PDFs
+    for i, doc in enumerate(all_docs):
+        # Initialize text splitter with chunk size 1000 and overlap 200
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splits = text_splitter.split_documents(doc)
+        all_docs_splits[f"doc {i}"] = splits
+
+    print(len(all_docs_splits))
+    # all_docs_splits -> {doc 1: [all the splits as list], doc 2: [all the splits as list]}
+    print("Splits :\n", all_docs_splits["doc 0"][0], all_docs_splits["doc 1"][0], "......")  
+    # show split of a selected doc
+
+    for key, value in all_docs_splits.items():
+        print(key, ": NO of splits created", len(value))
+
+    return all_docs_splits
+
+# ----------------------------------------------------------------------------
+# 1.2 Make Embeddings and Store within Vectorspaces
+# ----------------------------------------------------------------------------
+def vectorstores_creation(all_docs_splits, embedding_model) -> dict:
+    """
+    Input:
+        all_docs_splits : langchain splits
+    Output:
+        vectorstores : dict  
+            Format: {vectorstore 1: [Embed1, Embed2, ..., Embedn], vectorstore 2: [Embed1, Embed2, ..., Embedm]}
+    """
+
+    # Create vector embeddings for each document split
+    print("---------Vectorstores Creation---------")
+    vectorstores = {}
+
+    for key, value in all_docs_splits.items():
+        vectorstores[key] = Chroma.from_documents(documents=value, embedding=embedding_model)
+
+    return vectorstores
+
+# ----------------------------------------------------------------------------
+# 1.3 Make Labels
+# ----------------------------------------------------------------------------
+def label_creation(all_docs) -> dict:
+    """
+    Input:
+        all_docs : langchain document object
+    Output:
+        pages: dict  
+            Format: {doc 1: [page1, page2, ..., pagen], doc 2: [page1, page2, ..., pagem]}
+        responses: dict  
+            Format: {doc 1: [response1_set, response2_set, ..., responsen_set], 
+                     doc 2: [response1_set, response2_set, ..., responsem_set]}
+        senteces: dict  
+            Format: {doc 1: [sentences_set1], doc 2: [sentences_set1]}
+        sentences_list: dict  
+            Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
+    """
+
+    # Extract pages from all documents
+    print("---------Pages Extraction---------")
+    pages = {}
+    for i, doc in enumerate(all_docs):
+        pages[f"doc {i}"] = []
+        for j in doc:
+            pages[f"doc {i}"].append(j.page_content)
+
+    # Extract responses (headings) for each page using LLM
+    print("---------Responses Extraction---------")
+    responses = {}
+    for i in range(len(pages)):
+        responses[f"doc {i}"] = []
+        for page in pages[f"doc {i}"][:10]:
+            prompt = f"""
+            You need to understand the content of this page: {page}
+
+            Think about what aspects could differ if the same topic appeared in another similar document.
+            Based only on this page and your careful understanding, identify the **headings** that describe possible differences to check. Make the heading more detailed.
+
+            Focus **only on technical or impactful aspects**.
+            List **only** the headings, without any explanations or details.
+            """
+            response = llm.invoke(prompt)
+            responses[f"doc {i}"].append(response.content)
+
+    # Combine all responses into a single string per document
+    print("---------Sentences Extraction---------")
+    senteces = {}
+    for key, value in responses.items():
+        senteces[key] = ""
+        for i in range(len(value)):
+            senteces[key] += value[i]
+
+    # Split the combined responses into a list of sentences per document
+    sentences_list = {}
+    for key, value in senteces.items():
+        sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+
+    return sentences_list
+
+# ----------------------------------------------------------------------------
+# 1.4 Extract the Mapping labels
+# ----------------------------------------------------------------------------
+def mapping_labels(labels):
+    """
+    Input:
+        labels: dict  
+            Format: {doc 1: [label1, label2, ..., labeln], doc 2: [label1, label2, ..., labelm]}
+    Output:
+        embeddings: dict  
+            Format: {doc 1: [embed1, embed2, ..., embedn], doc 2: [embed1, embed2, ..., embedm]}  
+            Note: embed1 -> [num1, num2, ..., numd] (d-dimensional vector)
+        comparing_headings: list  
+            Format: [[doc0_label1, doc1_label1], [doc0_label2, doc1_label2], ...]
+    """
+
+    # Create embeddings for each label
+    print("---------Embedding Creation---------")
+    embeddings = {}
+    for key, value in labels.items():
+        embeddings[key] = []
+        for i in range(len(value)):
+            embeddings[key].append(embedding_model.embed_query(value[i]))
+
+    # Compute similarities between document embeddings
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    similarities = model.similarity(embeddings["doc 0"], embeddings["doc 1"])  # nxm similarity matrix
+
+    # Get top k matches per row based on similarity
+    comparing_headings = []
+    t = 0.5  # similarity threshold
+    values, indices = torch.topk(similarities, k=3, dim=1)  
+    # values: highest similarity scores, indices: corresponding indices
+    indices = indices.tolist()  # [[i00, i01, i02], [i10, i11, i12], ...]
+    values = values.tolist()    # [[v00, v01, v02], [v10, v11, v12], ...]
+
+    for i in range(len(indices)):
+        # Skip if the top similarity score is below threshold
+        if values[i][0] < t:
+            continue
+
+        # Print matched labels
+        print(labels["doc 0"][i])
+        print(labels["doc 1"][indices[i][0]])
+        comparing_headings.append([labels["doc 0"][i], labels["doc 1"][indices[i][0]]])
+        print('-' * 50)
+
+    print(f"---------Comparing Headings Creation {len(comparing_headings)}---------")
+    return comparing_headings
+
+# ----------------------------------------------------------------------------
+# 1.5 Structured LLM to generate the response
+# ----------------------------------------------------------------------------
+def labelized_llm(context1, context2):
+    """
+    Input:
+        context1 : str  
+            Text from the first source.
+        context2 : str  
+            Text from the second source.
+    Output:
+        response : BaseModel  
+            Contains structured output:
+                - contradiction_result: str  
+                    Indicates if there are any contradictions between the two contexts.
+                - reason: str  
+                    Explains the reason behind the contradiction (only if a contradiction exists).
+    """
+
+    # Create a chat prompt template to compare two contexts
+    tagging_prompt = ChatPromptTemplate.from_template("""
+    You are given two contexts from different sources.
+    Logically think about the desired information from the following passage.
+    Only think about the properties mentioned in the 'Classification' function.
+    
+    Passage:
+    Context 1:
+    {context1}
+
+    Context 2:
+    {context2}
+    """)
+
+    # Define the structured output schema
+    class Classification(BaseModel):
+        contradiction_result: str = Field(
+            description="Are there any contradictions between the two contexts. Must be 'CONTRADICTION' or 'NO CONTRADICTION'."
+        )
+        reason: Optional[str] = Field(
+            default=None,
+            description="Only provide a reason if there is a contradiction."
+        )
+
+    # Wrap LLM with structured output
+    structured_llm = llm.with_structured_output(Classification)
+
+    # Invoke the prompt with the provided contexts
+    prompt = tagging_prompt.invoke({"context1": context1, "context2": context2})
+    response = structured_llm.invoke(prompt)
+
+    print(response)
+    return response
+
+# ----------------------------------------------------------------------------
+# 1.6 Main comparison function
+# ----------------------------------------------------------------------------
+def compare_documents(extracted_file_contents: list):
+    """
+    Input:
+        extracted_file_contents : list
+            Currently unused, placeholder for extracted content if needed.
+    Output:
+        output : str
+            Concatenated reasons for contradictions detected between document pairs.
+    """
+
+    print("---------STARTED---------")
+
+    print("---------LLM/Embeddings Initialization---------")
+
+    print("---------Document Extraction---------")
+    # Get the documents from the folder
+    folder_path = "/home/tharaka/thakshana/doc_comparison/data"  # folder containing all PDFs
     all_docs = []
 
     for filename in os.listdir(folder_path):
@@ -95,244 +317,79 @@ def compare_documents(extracted_file_contents: list):
             loader = PyPDFLoader(os.path.join(folder_path, filename))
             docs = loader.load()
             all_docs.append(docs)  # append all pages to the main list
-    
-    # folder_path = "/home/tharaka/thakshana/doc_comparison/data"  # folder containing all your PDFs
-    # all_docs = []
 
-    # all_docs = documents
+    print(f"Loaded a total of {len(all_docs)} documents")
 
-    print(f"Loaded a total of {len(all_docs)} documents ")
-    print("---------Document Extracted---------")
+    # Only take the first 2 pages from each document for testing
+    #all_docs = [l[:2] for l in all_docs]
 
-    # Split
-    splits_dict={}
-    for i, doc in enumerate(all_docs):
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(doc)
-        splits_dict[f"doc {i}"] = splits
-    print(len(splits_dict))
-    #splits_dict -> {doc 1:[all the splits as list], doc 2: [all the splits as a list]}
+    print("---------Split Creation---------")
+    all_docs_splits = split_creation(all_docs)
 
-    print("Splits :\n",splits_dict["doc 0"][0],splits_dict["doc 1"][0],"......") #show split of a seleted doc
+    print("---------Vectorstores Creation---------")
+    all_docs_vectorstores = vectorstores_creation(all_docs_splits, embedding_model)
 
-    for key, value in splits_dict.items():
-        print(key,": NO of chunks created",len(value))
-    print("---------Splits Created---------")
-    # Embed
-    vectorstores = {}
-    for key, value in splits_dict.items():
-
-        vectorstores[key] = Chroma.from_documents(documents=value,
-                                            embedding=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2"))
-
-    print("---------vectorstores Created---------")
-
-    retrievers={}
-    for key, value in vectorstores.items():
+    print("---------Retrievers Creation---------")
+    retrievers = {}
+    for key, value in all_docs_vectorstores.items():
         retrievers[key] = value.as_retriever()
 
+    print("---------Label Creation---------")
+    # Extract labels/sentences from documents
+    labels = label_creation(all_docs)  # sentences_list: dict {doc 1:[sentence1,...], doc 2:[sentence1,...]}
+    l1 = len(labels["doc 1"])
+    l0 = len(labels["doc 0"])
+    details = f"Labels created by doc0 {l1}\n Labels created by doc1 {l0}\n"
 
-
-    print("---------retrievers Created---------")
-
-    # # Prompt
-    # prompt = hub.pull("rlm/rag-prompt")
-
-    # # LLM
-    # llm = ChatOpenAI(
-    #     model="gpt-oss:120b",
-    #     api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
-    #     base_url="https://ollama.com/v1",
-    #     # organization="...",
-    #     # other params...
-    # )
-
-    # # Post-processing
-    # def format_docs(all_docs):
-    #     return "\n\n".join(doc.page_content for doc in all_docs)
-
-    # # Chain
-    # rag_chain = (
-    #     {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    #     | prompt
-    #     | llm
-    #     | StrOutputParser()
-    # )
-
-    # # Question
-    # rag_chain.invoke("Chatgpt?")
-
-    """---
-
-    **CLUSTER**
-
-    ---
-
-    ☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁☁
-    """
-
-    print("---------Pages Extraction---------")
-    pages={}
-    for i, doc in enumerate(all_docs):
-        pages[f"doc {i}"]=[]
-        for j in doc:
-            pages[f"doc {i}"].append(j.page_content)
-
-
-    print("---------responses Extraction---------")
-    responses={}
-    for i in range(len(pages)):
-        responses[f"doc {i}"]=[]
-        for page in pages[f"doc {i}"][:10]:
-            prompt = f"""
-            You need to understand the content of this page: {page}
-
-            Think about what aspects could differ if the same topic appeared in another similar document.
-            Based only on this page and your careful understanding, identify the **headings** that describe possible differences to check.Make the heading more detailed
-
-            Focus **only on technical or impactful aspects**.
-            List **only** the headings, without any explanations or details.
-            """
-
-
-            response = llm.invoke(prompt)
-            responses[f"doc {i}"].append(response.content)
-
-    print("---------senteces Extraction---------")
-    senteces = {}
-    for key,value in responses.items():
-        senteces[key] = ""
-        for i in range(len(value)):
-            senteces[key] += value[i]
-
-    sentences_list={}
-    for key,value in senteces.items():
-        sentences_list[key] = [line for line in value.split("\n") if line.strip()]
-
-    embedding=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-
-    print("---------Embedding Creation---------")
-    embeddings = {}
-    for key,value in sentences_list.items():
-        embeddings[key] = []
-        for i in range (len(value)):
-            embeddings[key].append(embedding.embed_query(value[i]))
-
-
-    """method 1
-
-    check similarity between each of the embeddings and then take the maximun chunk out
-
-    method 2 will be through clustering
-    """
-    print("---------similarity Calculation ---------")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    similarities = model.similarity(embeddings["doc 0"], embeddings["doc 1"])
-
-    # Get argmax indices per row
-    indices = torch.argmax(similarities, dim=1)
-
-    print(indices)   # tensor([1, 3, 1])
-
-    values, indices = torch.max(similarities, dim=1)
-    print(values)   # max values
-    print(indices)  # indices of max values
-
-    # Get top 3 per row
-    comparing_headings=[]
-    values, indices = torch.topk(similarities, k=3, dim=1)
-    indices = indices.tolist()
-    values = values.tolist()
-    for i in range(len(indices)):   #len(indices)
-        #print(f"i: ", indices[i], values[i])
-        if values[i][0] < 0.5:
-            continue
-            print(sentences_list["doc 0"][i] , "NO MATCH DETECTED")
-            continue
-        print(sentences_list["doc 0"][i])
-        print(sentences_list["doc 1"][indices[i][0]])
-        comparing_headings.append([sentences_list["doc 0"][i],sentences_list["doc 1"][indices[i][0]]])
-        print('-' * 50)
-
-
-    print(f"---------comparing_headings Creation {len(comparing_headings)}---------")
-
+    print("---------Similarity Calculation---------")
+    comparing_headings = mapping_labels(labels)
+    details += f"Total labels Compared: {len(comparing_headings[0])} \n "
     #### RETRIEVAL and GENERATION ####
 
-
-    # Prompt
-    prompt = ChatPromptTemplate.from_template("""
-    You are given two contexts from different sources.
-
-    Context 1:
-    {context1}
-
-    Context 2:
-    {context2}
-
-    Reason:
-    {reason}
-
-    Question: Are there any contradictions between the two contexts?
-    If yes, list them clearly. If no, say "No contradictions found" and Explain the reaons only if Reason is true
-    """)
-
-    # LLM
-    llm = ChatOpenAI(
-        model="gpt-oss:120b",
-        api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
-        base_url="https://ollama.com/v1",
-        # organization="...",
-        # other params...
-    )
-
-    # Post-processing
-    def format_docs(all_docs):
-        return "\n\n".join(doc.page_content for doc in all_docs)
-
-    # Chain
-    rag_chain = (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
-
+    # Function to format document pages as a single string
     format_docs = lambda docs: "\n\n".join([d.page_content for d in docs])
 
+    # Retrieve top-k relevant documents for a pair of labels
     def get_topk_docs(pair, k=5):
         docs1 = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
         docs2 = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
         return docs1, docs2
 
-    output=""
-        # File to store results
+    
 
-    # File path inside the folder
+    # File path to save CSV results
     output_file = os.path.join(folder_path, "doc_pair_comparison_results.csv")
 
-    # Write header
+    # Write CSV header
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["Doc_Pair", "Docs1_Content", "Docs2_Content", "Comparison_Result"])
 
-    for pair in comparing_headings[:10]: # To test we only compare first 10 
+    output = ""
+    # Compare first 10 pairs of headings
+    for pair in comparing_headings[:]:
         print(pair)
-        docs1 ,docs2 = get_topk_docs(pair)
+        docs1, docs2 = get_topk_docs(pair)
         docs1_f = format_docs(docs1)
         docs2_f = format_docs(docs2)
-        response = rag_chain.invoke({"context1": docs1_f, "context2": docs2_f,"reason": "NO"})
+
+        # Get LLM response for the document pair
+        response = labelized_llm(docs1_f, docs2_f)
         print(response)
-        if "no contradiction" not in response.lower():  
-            output += response
-          
+
+        # Append reason to output if a contradiction is found
+        if (response.reason):
+            output += response.reason
+
         # Append row to CSV
         with open(output_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([pair, docs1_f, docs2_f, response])
-            print('- -' * 50)
+            print('-' * 50)
+
+    # Note: Dendrogram clustering logic can be applied later if needed
     #dendogram-> conncet all the nodes via low distance are conneted first method to final single cluster(n+n,n+c,c+c)  Then cut the dendogram from the threshhold value and use thoscluserts
-    return output
+    return details+output
 
 
 class State(TypedDict):
