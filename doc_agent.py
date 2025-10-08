@@ -220,8 +220,6 @@ def compare_documents(extracted_file_contents: list):
             embeddings[key].append(embedding.embed_query(value[i]))
 
 
-
-
     """method 1
 
     check similarity between each of the embeddings and then take the maximun chunk out
