@@ -5,56 +5,48 @@ Pipelined - Implemented on open web ui for Document Comparison -> Identify contr
 1. Add two files in to the chat
 2. Point out the contradictions between the two documents
 """
-
-from typing import List, Union, Generator, Iterator, Optional
-from pydantic import BaseModel, Field
-from typing import List
-from typing import List, Union, Generator, Iterator
-from typing import ClassVar
+# Standard library imports
 import os
 import re
-from typing import List
-from pydantic import BaseModel, Field
+import csv
+from typing import List, Union, Generator, Iterator, Optional, ClassVar
+from typing_extensions import TypedDict, Literal
+
+# Third-party imports
 import requests
-
-from langchain_openai import ChatOpenAI #langgraph
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import MessagesState
-from langgraph.graph import START, StateGraph, END
-from typing_extensions import TypedDict
-from typing import Literal
-from langgraph.checkpoint.memory import MemorySaver #as  the memmory is only runtime use sqlite
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import StateGraph
-from langfuse.langchain import CallbackHandler
-
-
-from langchain_openai import ChatOpenAI
-from langchain_huggingface import HuggingFaceEmbeddings
 import bs4
-from langchain import hub
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import WebBaseLoader
-from langchain_community.vectorstores import Chroma
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.document_loaders import PyPDFLoader
-import os
-from sentence_transformers import SentenceTransformer, util,  SimilarityFunction
-from sentence_transformers import CrossEncoder
-from sentence_transformers import SparseEncoder
-
+import torch
 from sklearn.cluster import AgglomerativeClustering
 
-from sentence_transformers import SentenceTransformer
-from langchain.prompts.chat import ChatPromptTemplate
-import torch
- 
+# Sentence Transformers
+from sentence_transformers import SentenceTransformer, util, SimilarityFunction, CrossEncoder, SparseEncoder
+
+# Pydantic
+from pydantic import BaseModel, Field
+
+# LangChain imports
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.vectorstores import Chroma
+from langchain.prompts.chat import ChatPromptTemplate
+from langchain import hub
 
-import csv
+# LangGraph imports
+from langgraph.graph import MessagesState, START, StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
+# LangFuse
+from langfuse.langchain import CallbackHandler
+
+from langchain_core.documents import Document
 
 # Initialize Langfuse CallbackHandler for Langchain (tracing)
 langfuse_handler = CallbackHandler()
@@ -76,15 +68,15 @@ embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 ################################################ 1 Core Functionalities of a Document Comparison Agent ######################################################
         
 # ----------------------------------------------------------------------------
-# 1.1 Make Chunks
+# 1.1.0 Make Chunks -> recursive chunk creation
 # ----------------------------------------------------------------------------
 def split_creation(all_docs) -> dict:
     """
     Input:
         all_docs : langchain document object
     Output:
-        splits : dict  
-            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]}
+        all_docs_splits_f : dict  
+            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]} # each split is document object it self
     """
 
     print("---------Splits Creation---------")
@@ -104,8 +96,125 @@ def split_creation(all_docs) -> dict:
     for key, value in all_docs_splits.items():
         print(key, ": NO of splits created", len(value))
 
+
+    
     return all_docs_splits
 
+## ----------------------------------------------------------------------------
+# 1.1.1 Make Chunks -> agentic chunk creation
+# ----------------------------------------------------------------------------
+def agentic_split_creation(all_docs) -> dict:
+    """
+    Input:
+        all_docs : langchain document object
+    Output:
+        splits : dict  
+            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]}
+    """
+
+    print("---------Agentic Splits Creation---------")
+    all_docs_splits = {}
+
+    chunking_prompt_a = """
+    You are a chunking agent. Your task is to divide the given page (Context 1) into several logical chunks. 
+    - Create boundaries only where necessary, based on the content’s meaning. 
+    - Remove unnecessary indentations as they do not affect the main idea. 
+    - Ensure each chunk represents a coherent section of the text.
+    """
+    chunking_prompt_b = """
+        You are a chunking agent. Your task is to divide the given page (Context 1) into several logical chunks.
+        - Create boundaries only where necessary, based on the content’s meaning. 
+        - Remove unnecessary indentations as they do not affect the main idea.
+        - Ensure each chunk represents a coherent section of the text.
+        - Do NOT omit, summarize, or ignore any information from the context.
+        - Every sentence, number, date, name, or detail must be preserved in its entirety within the chunks.
+        - Maintain the original order of the content within and across chunks.
+        - Try to use lesser no of chunking as possible 
+            EX:
+                3.2. GPT-3
+            Launched in 2020, GPT-3 is the third and most advanced version of the GPT series, featuring several enhancements over GPT-2. GPT-3 is pretrained on a massive dataset called the WebText2, which contains hundreds of gigabytes of text from diverse sources, including web pages, books, and articles [111]. The model is significantly larger than GPT-2, with 175 billion parameters, making it one of the largest AI language models available. GPT-3 excels at various NLP tasks, such as text generation, summarization, translation, and code generation, often with minimal fine-tuning. The model's size and complexity allow it to generate more coherent, context-aware, and human-like text compared to GPT-2. GPT-3 is available through the OpenAI API, enabling developers and researchers to access the model for their applications [112].
+            --------------------------------------------------
+            Here are some of the pros and cons of GTP-3.
+            (c) Pros:
+            (i) Wide range of natural language processing tasks: GPT-3 can be used for a wide range of natural language processing tasks, including language translation, text summarization, and question answering.
+            (ii) High-quality text generation: GPT-3 is known for its ability to generate high-quality human-like text, which has a wide range of applications, including chatbots and content creation.
+            (iii) Large-scale architecture: GPT-3's architecture is designed to handle large amounts of data, which makes it suitable for applications that require processing of large datasets.
+            (iv) Zero-shot learning capabilities: GPT-3 has the ability to perform some tasks without explicit training, which can save time and resources.
+            --------------------------------------------------
+            (d) Cons:
+            (i) Large computational requirements: GPT-3's large model size and complex architecture require significant computational resources, making it difficult to deploy on devices with limited computational resources.
+            (ii) Limited interpretability: GPT-3's complex architecture makes it difficult to interpret its internal workings, which can be a challenge for researchers and practitioners who want to understand how it makes its predictions.
+            (iii) Language-specific: Like other transformer-based models, GPT-3 is primarily trained on English language data and may not perform as well on other languages without additional training or modifications.
+            (iv) Ethical concerns: GPT-3's capabilities raise ethical concerns about its potential misuse and the need for responsible deployment.
+
+            we can have all of the above into one chunk
+        """
+    # Create a chat prompt template to compare two contexts
+    tagging_prompt = ChatPromptTemplate.from_template("""
+    You are given two contexts 
+    Context 1:Current page to analyze:.
+    Context 2: Context (for understanding only the previous and next pages)
+
+    Passage:
+    Context 1:
+    {context1}
+
+    Context 2:
+    {context2}
+
+
+    """)
+
+    # Define the structured output schema
+    class Classification(BaseModel):
+            chunks: List[str] = Field(
+                description=chunking_prompt_b
+            )
+    # Wrap LLM with structured output
+    structured_llm = llm.with_structured_output(Classification)
+  
+
+    splits = []
+
+    for i, doc in enumerate(all_docs):
+        # Initialize text splitter with chunk size 1000 and overlap 200
+
+        for page in doc[:4]:
+       
+            prompt = tagging_prompt.invoke({"context1": page.page_content, "context2": "None"}) #use context two if we need to provide an additonal overview
+            response = structured_llm.invoke(prompt)
+            splits.append(response)
+
+        all_docs_splits[f"doc {i}"] = splits
+
+    print(len(all_docs_splits))
+    # all_docs_splits -> {doc 1: [all the splits as list], doc 2: [all the splits as list]}
+    print("Splits :\n", all_docs_splits["doc 0"][0])  
+    # show split of a selected doc
+
+    for key, value in all_docs_splits.items():
+        print(key, ": NO of splits created", len(value))
+
+        # make the same format previously udes in splits
+    all_docs_splits_merged = {}
+    for key, value in all_docs_splits.items():
+        all_docs_splits_merged[key] = []
+        for i in value:
+            print(i.chunks)
+            all_docs_splits_merged[key] += i.chunks
+        
+    all_docs_splits = all_docs_splits_merged
+
+    all_docs_splits_f = {}
+    for key, value in all_docs_splits.items():
+      all_docs_splits_f[key] = []
+      for each in value:
+        all_docs_splits_f[key].append(Document(
+            page_content=each,
+            metadata={"source": "user_input", "length": len(each)}
+        ))
+    return all_docs_splits_f
+    
 # ----------------------------------------------------------------------------
 # 1.2 Make Embeddings and Store within Vectorspaces
 # ----------------------------------------------------------------------------
@@ -128,7 +237,57 @@ def vectorstores_creation(all_docs_splits, embedding_model) -> dict:
     return vectorstores
 
 # ----------------------------------------------------------------------------
-# 1.3 Make Labels
+# 1.3 Make the system prompt -> prompt tune is  needed after testing
+# ----------------------------------------------------------------------------
+def build_system_message(deep_level):
+    base_message = (
+        "You are a logical extraction agent. Your task is to identify and extract ALL possible "
+        f"{deep_level} conceptual labels from the user's document text. "
+        "Each label represents a distinct logical or semantic idea expressed in the document, "
+        "which could later be compared against other documents to detect similarities or contradictions.\n\n"
+        "Strict rules:\n"
+        "- Output ONLY clean, meaningful label titles.\n"
+        "- Do NOT include author names, affiliations, numbers, dates, citations, or examples.\n"
+        "- Avoid repeating labels that refer to the same concept using different wording.\n"
+        "- Preserve capitalization as it appears in the text.\n"
+        "- Avoid commentary, explanation, or numbering.\n"
+        "- Output must be a simple list (one label per line).\n\n"
+    )
+
+    if deep_level.lower() == "high":
+        level_details = (
+            "Focus ONLY on broad, high-level conceptual labels that define the overall structure or intent "
+            "of the document (e.g., 'Research Problem', 'Proposed Solution', 'Results Summary'). "
+            "Ignore internal breakdowns or fine-grained details."
+        )
+    elif deep_level.lower() == "medium":
+        level_details = (
+            "Extract both the main conceptual labels and key sub-concepts that describe meaningful internal ideas "
+            "(e.g., 'Data Processing Method', 'Model Training Strategy', 'Error Analysis'). "
+            "Avoid sentence fragments or inline phrases that do not represent self-contained ideas."
+        )
+    elif deep_level.lower() == "deep":
+        level_details = (
+            "Extract every distinct conceptual label possible — including all sub-ideas, internal processes, "
+            "and reasoning segments that represent separate logical components. "
+            "Each label should describe a meaningful part of the document’s reasoning, approach, or evidence. "
+            "Avoid listing trivial or linguistic patterns."
+        )
+    else:
+        level_details = "Extract all meaningful conceptual labels representing distinct logical ideas."
+
+    example = (
+        "\n\nExample:\n"
+        "**Text:** 'This paper proposes a transformer-based architecture to improve translation accuracy.'\n"
+        "→ Possible label: **Proposed Architecture**\n"
+        "**Text:** 'The evaluation shows significant improvement over baselines.'\n"
+        "→ Possible label: **Performance Evaluation**"
+    )
+
+    return base_message + level_details + example
+
+# ----------------------------------------------------------------------------
+# 1.4 Make Labels
 # ----------------------------------------------------------------------------
 def label_creation(all_docs) -> dict:
     """
@@ -146,6 +305,8 @@ def label_creation(all_docs) -> dict:
             Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
     """
 
+    deep_level = "high"
+    sys_msg = build_system_message(deep_level)
     # Extract pages from all documents
     print("---------Pages Extraction---------")
     pages = {}
@@ -164,12 +325,12 @@ def label_creation(all_docs) -> dict:
             You need to understand the content of this page: {page}
 
             Think about what aspects could differ if the same topic appeared in another similar document.
-            Based only on this page and your careful understanding, identify the **headings** that describe possible differences to check. Make the heading more detailed.
-
-            Focus **only on technical or impactful aspects**.
-            List **only** the headings, without any explanations or details.
+            Based only on this page and your careful understanding, identify the **LABELS** that describe possible differences to check. Make the LABELS more detailed.
+            List **only** the LABELS, without any explanations or details.
             """
-            response = llm.invoke(prompt)
+            system_message =  SystemMessage(content=sys_msg)
+            human_message = HumanMessage(content=prompt)
+            response = llm.invoke([system_message, human_message])
             responses[f"doc {i}"].append(response.content)
 
     # Combine all responses into a single string per document
@@ -188,7 +349,7 @@ def label_creation(all_docs) -> dict:
     return sentences_list
 
 # ----------------------------------------------------------------------------
-# 1.4 Extract the Mapping labels
+# 1.5 Extract the Mapping labels
 # ----------------------------------------------------------------------------
 def mapping_labels(labels):
     """
@@ -218,7 +379,7 @@ def mapping_labels(labels):
     # Get top k matches per row based on similarity
     comparing_headings = []
     t = 0.5  # similarity threshold
-    values, indices = torch.topk(similarities, k=3, dim=1)  
+    values, indices = torch.topk(similarities, k=1, dim=1)  
     # values: highest similarity scores, indices: corresponding indices
     indices = indices.tolist()  # [[i00, i01, i02], [i10, i11, i12], ...]
     values = values.tolist()    # [[v00, v01, v02], [v10, v11, v12], ...]
@@ -238,7 +399,7 @@ def mapping_labels(labels):
     return comparing_headings
 
 # ----------------------------------------------------------------------------
-# 1.5 Structured LLM to generate the response
+# 1.6 Structured LLM to generate the response
 # ----------------------------------------------------------------------------
 def labelized_llm(context1, context2):
     """
@@ -291,7 +452,7 @@ def labelized_llm(context1, context2):
     return response
 
 # ----------------------------------------------------------------------------
-# 1.6 Main comparison function
+# 1.7 Main comparison function
 # ----------------------------------------------------------------------------
 def compare_documents(extracted_file_contents: list):
     """
@@ -324,7 +485,7 @@ def compare_documents(extracted_file_contents: list):
     #all_docs = [l[:2] for l in all_docs]
 
     print("---------Split Creation---------")
-    all_docs_splits = split_creation(all_docs)
+    all_docs_splits = agentic_split_creation(all_docs)
 
     print("---------Vectorstores Creation---------")
     all_docs_vectorstores = vectorstores_creation(all_docs_splits, embedding_model)
@@ -343,7 +504,7 @@ def compare_documents(extracted_file_contents: list):
 
     print("---------Similarity Calculation---------")
     comparing_headings = mapping_labels(labels)
-    details += f"Total labels Compared: {len(comparing_headings[0])} \n "
+    details += f"Total labels Compared: {len(comparing_headings)} \n "
     #### RETRIEVAL and GENERATION ####
 
     # Function to format document pages as a single string
@@ -366,7 +527,7 @@ def compare_documents(extracted_file_contents: list):
         writer.writerow(["Doc_Pair", "Docs1_Content", "Docs2_Content", "Comparison_Result"])
 
     output = ""
-    # Compare first 10 pairs of headings
+    # Compare first n pairs of headings
     for pair in comparing_headings[:]:
         print(pair)
         docs1, docs2 = get_topk_docs(pair)
@@ -380,6 +541,7 @@ def compare_documents(extracted_file_contents: list):
         # Append reason to output if a contradiction is found
         if (response.reason):
             output += response.reason
+        output+='\n\n'
 
         # Append row to CSV
         with open(output_file, mode='a', newline='', encoding='utf-8') as f:
@@ -531,7 +693,7 @@ class Pipeline:
             return []   
 
     
-################################################ 2 Functions in knowledge base ######################################################
+################################################ 2 Functions into open-webUI api calls ######################################################
         
 # ----------------------------------------------------------------------------
 # 2.1 Retrieve the latest file IDs (up to a specified count)
@@ -560,8 +722,8 @@ class Pipeline:
             print(f"Error: {response.status_code} - {response.text}")
             return []
 
-        # ----------------------------------------------------------------------------
-# 2.9 Get detailed content of specific files (by file IDs) --> Used when file_ids are known
+# ----------------------------------------------------------------------------
+# 2.2 Get detailed content of specific files (by file IDs) --> Used when file_ids are known
 # ----------------------------------------------------------------------------
     def get_file_details(self, token, file_ids) -> list:
         """
@@ -594,7 +756,41 @@ class Pipeline:
                 }
         return file_details
 
-    
+ # ----------------------------------------------------------------------------
+# 2.3 Fetches the latest (most recent) chat ID from the conversation list
+# ----------------------------------------------------------------------------      
+    def get_current_chat_id(self, token) -> str:
+        """
+        Fetches the latest (most recent) chat ID from the conversation list
+        using the Open WebUI API endpoint. This represents the ongoing chat.
+
+        Args:
+            token (str): Bearer token for authentication.
+
+        Returns:
+            str: Chat ID of the latest conversation, or [] on error.
+        """
+        url = f'{self.valves.OPEN_WEB_UI_BASE_URL}/chats/list?page=1'  # Retrieves most recent chats (first page)
+        headers = {
+            'accept': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            chat = response.json()
+            chat_id = chat[0]['id']
+            return chat_id
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return []    
+ 
+################################################ 3 Graph ######################################################
+
+# ----------------------------------------------------------------------------
+# 3.1 NODES -> functions them self
+# ----------------------------------------------------------------------------
     def is_general(self, state: State) -> Literal["General_chat_test_node","Begin_node"]:
         """
         check whether the user need to move with the general stage
@@ -602,7 +798,6 @@ class Pipeline:
         user_message = state["graph_state"]
         return "General_chat_test_node" if (user_message.lower()=="yes") else "Begin_node"
 
-    
     def Begin_node(self, state: State):
         print("-- Graph begin --")
         state["current_node"] = "Begin_node"
@@ -662,7 +857,7 @@ class Pipeline:
         
         return state
 
-    
+
     def General_chat_node(self, state: State): #use global token - pipeline class
         print("General_chat_node")
         state["current_node"] = "General_chat_node" # as this is a interrupt node this function won't call -> fix it now it calls by maming as node
@@ -709,7 +904,9 @@ class Pipeline:
             return "DOC_processor"  
 
 
-
+# ----------------------------------------------------------------------------
+# 3.2 Build graph
+# ----------------------------------------------------------------------------
     def graph_builder(self) -> dict:
         
         builder = StateGraph(State)
@@ -733,33 +930,7 @@ class Pipeline:
         graph = builder.compile(interrupt_before=["General_chat_node","is_file_upload_node"],checkpointer=memory)
         return graph
         ...      
-            
-    def get_current_chat_id(self, token) -> str:
-        """
-        Fetches the latest (most recent) chat ID from the conversation list
-        using the Open WebUI API endpoint. This represents the ongoing chat.
-
-        Args:
-            token (str): Bearer token for authentication.
-
-        Returns:
-            str: Chat ID of the latest conversation, or [] on error.
-        """
-        url = f'{self.valves.OPEN_WEB_UI_BASE_URL}/chats/list?page=1'  # Retrieves most recent chats (first page)
-        headers = {
-            'accept': 'application/json',
-            'Authorization': f'Bearer {token}'
-        }
-
-        response = requests.get(url, headers=headers)
-
-        if response.status_code == 200:
-            chat = response.json()
-            chat_id = chat[0]['id']
-            return chat_id
-        else:
-            print(f"Error: {response.status_code} - {response.text}")
-            return []        
+         
             
             
             
