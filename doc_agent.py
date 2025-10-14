@@ -48,12 +48,40 @@ from langfuse.langchain import CallbackHandler
 
 from langchain_core.documents import Document
 
+import shutil
+import time
+
+######################################################### Things to do #########################################################
+"""
+1. w/o making labels through llm let labels be the same chunk for efficiency and check the correctness
+2. use the same agentic chunks to used to create labels 
+
+issues
+If the files won't uploaded but choose from panel it will update the swagger be so code identify as file upload when extracting the etxt from the be
+
+"""
+######################################################### Things to do #########################################################
+
+
 # Initialize Langfuse CallbackHandler for Langchain (tracing)
 langfuse_handler = CallbackHandler()
 #Initialize the llm as openai based api from ollama cloud models
+#api_key = "78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF"
+
+# Tune up params
+THRESHOLD_FOR_LABEL_SELECTION = 0.7 # low means farther away labels also be considered
+TYPE_OF_CHUNK_RETRIEVAL = "label_bind" # ["sementic_search", "label_bind", "both"]
+PAGE_SIZE_FOR_CHUNKING = 500 # CHARS
+LOCAL_FOLDER_PATH = "/home/tharaka/thakshana/doc_comparison/data"
+DEEP_LEVEL = 'safe'
+MODEL = "gpt-oss:120b"  # available models = ["deepseek-v3.1:671b-cloud", "gpt-oss:20b-cloud", "gpt-oss:120b-cloud", "kimi-k2:1t-cloud", "qwen3-coder:480b-cloud"]
+NUM_OF_CHUNKS_RETRIVE_FOR_EACH_LABEL = 5 #
+NUM_OF_LABELS_SELECTED_FOR_EACH = 1 #
+
+
 llm = ChatOpenAI(
-    model="gpt-oss:120b",
-    api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+    model=MODEL,
+    api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk",  # if you prefer to pass api key in directly instaed of using env vars
     base_url="https://ollama.com/v1",
     # temperature=0,
     # max_tokens=None,
@@ -64,11 +92,12 @@ llm = ChatOpenAI(
 )
     
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
+memory = {}
+all_docs_global = []
 ################################################ 1 Core Functionalities of a Document Comparison Agent ######################################################
         
 # ----------------------------------------------------------------------------
-# 1.1.0 Make Chunks -> recursive chunk creation
+# 1.10 Make Chunks -> recursive chunk creation
 # ----------------------------------------------------------------------------
 def split_creation(all_docs) -> dict:
     """
@@ -101,7 +130,7 @@ def split_creation(all_docs) -> dict:
     return all_docs_splits
 
 ## ----------------------------------------------------------------------------
-# 1.1.1 Make Chunks -> agentic chunk creation
+# 1.11 Make Chunks -> agentic chunk creation
 # ----------------------------------------------------------------------------
 def agentic_split_creation(all_docs) -> dict:
     """
@@ -179,7 +208,7 @@ def agentic_split_creation(all_docs) -> dict:
     for i, doc in enumerate(all_docs):
         # Initialize text splitter with chunk size 1000 and overlap 200
 
-        for page in doc[:4]:
+        for page in doc[:]:
        
             prompt = tagging_prompt.invoke({"context1": page.page_content, "context2": "None"}) #use context two if we need to provide an additonal overview
             response = structured_llm.invoke(prompt)
@@ -214,7 +243,7 @@ def agentic_split_creation(all_docs) -> dict:
             metadata={"source": "user_input", "length": len(each)}
         ))
     return all_docs_splits_f
-    
+
 # ----------------------------------------------------------------------------
 # 1.2 Make Embeddings and Store within Vectorspaces
 # ----------------------------------------------------------------------------
@@ -230,9 +259,15 @@ def vectorstores_creation(all_docs_splits, embedding_model) -> dict:
     # Create vector embeddings for each document split
     print("---------Vectorstores Creation---------")
     vectorstores = {}
-
+    var = int(time.time())
     for key, value in all_docs_splits.items():
-        vectorstores[key] = Chroma.from_documents(documents=value, embedding=embedding_model)
+        persist_dir = f"./db_file{key}{var}"
+
+        # --- Remove old DB directory if it exists ---
+        if os.path.exists(persist_dir):
+            shutil.rmtree(persist_dir)  # deletes all old data
+            print("Delete the exsisting DB")
+        vectorstores[key] = Chroma.from_documents(documents=value, embedding=embedding_model,persist_directory=persist_dir)
 
     return vectorstores
 
@@ -274,7 +309,7 @@ def build_system_message(deep_level):
             "Avoid listing trivial or linguistic patterns."
         )
     else:
-        level_details = "Extract all meaningful conceptual labels representing distinct logical ideas."
+        level_details = "Extract all meaningful conceptual labels representing distinct logical ideas.Only upto 3 for a given chunk"
 
     example = (
         "\n\nExample:\n"
@@ -289,7 +324,7 @@ def build_system_message(deep_level):
 # ----------------------------------------------------------------------------
 # 1.4 Make Labels
 # ----------------------------------------------------------------------------
-def label_creation(all_docs) -> dict:
+def label_creation(all_docs,deep_level = "high") -> dict:
     """
     Input:
         all_docs : langchain document object
@@ -305,7 +340,7 @@ def label_creation(all_docs) -> dict:
             Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
     """
 
-    deep_level = "high"
+    
     sys_msg = build_system_message(deep_level)
     # Extract pages from all documents
     print("---------Pages Extraction---------")
@@ -320,7 +355,9 @@ def label_creation(all_docs) -> dict:
     responses = {}
     for i in range(len(pages)):
         responses[f"doc {i}"] = []
+        count = 0
         for page in pages[f"doc {i}"][:10]:
+            
             prompt = f"""
             You need to understand the content of this page: {page}
 
@@ -330,8 +367,261 @@ def label_creation(all_docs) -> dict:
             """
             system_message =  SystemMessage(content=sys_msg)
             human_message = HumanMessage(content=prompt)
-            response = llm.invoke([system_message, human_message])
-            responses[f"doc {i}"].append(response.content)
+            response = llm.invoke([system_message, human_message]) #response = set of responses \n sepearate
+            responses[f"doc {i}"].append(response.content) # responses[key] = [[],[]] list of lists
+
+
+    # Combine all responses into a single string per document
+    print("---------Sentences Extraction---------") 
+    senteces = {}
+    for key, value in responses.items():
+        senteces[key] = ""
+        
+        for i in range(len(value)):
+            senteces[key] += value[i]
+
+    # Split the combined responses into a list of sentences per document
+    sentences_list = {}
+    for key, value in senteces.items():
+        sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+
+    return sentences_list
+
+def label_creation_with_memory(all_docs,deep_level = "high") -> dict:
+    """
+    Input:
+        all_docs : langchain document object
+    Output:
+        pages: dict  
+            Format: {doc 1: [page1, page2, ..., pagen], doc 2: [page1, page2, ..., pagem]}
+        responses: dict  
+            Format: {doc 1: [response1_set, response2_set, ..., responsen_set], 
+                     doc 2: [response1_set, response2_set, ..., responsem_set]}
+        senteces: dict  
+            Format: {doc 1: [sentences_set1], doc 2: [sentences_set1]}
+        sentences_list: dict  
+            Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
+
+        memory = memory['doc 0']["Confidential Information Use Restrictions"] # file no , label name ...
+    """
+
+
+    # Define the structured output schema
+    class Classification(BaseModel):
+        response: List[str] = Field(
+            description="List **only** the LABELS, without any explanations or details. as a list"
+        )
+
+    structured_llm = llm.with_structured_output(Classification)
+
+    sys_msg = build_system_message(deep_level)
+    # Extract pages from all documents
+    print("---------Pages Extraction---------")
+    pages = {}
+    for i, doc in enumerate(all_docs):
+        pages[f"doc {i}"] = []
+        for j in doc:
+            pages[f"doc {i}"].append(j.page_content)
+    #Document obj -> text extraction
+
+    # Extract responses (headings) for each page using LLM
+    print("---------Responses Extraction---------")
+    responses = {}
+    memory_inside = {}
+    for i in range(len(pages)):
+        responses[f"doc {i}"] = []
+        memory_inside[f"doc {i}"] = {}
+        count = 0
+        page_no= 0
+        total_pages = len(pages[f"doc {i}"])
+        for page in pages[f"doc {i}"][:]:
+            
+            prompt = f"""
+                You are given the following page content:
+                {page}
+
+                Your task:
+                1. Carefully read and understand the content of this page.
+                2. Ignore any irrelevant characters, extra newlines, or formatting artifacts not intended to be part of the document.
+                3. Think critically about how this page’s content might differ if the same topic appeared in another, similar document.
+                4. Based solely on this page, identify detailed and descriptive **LABELS** representing possible aspects or points of difference to check.
+
+                Output:
+                - Provide **only** a list of LABELS (no explanations, reasoning, or additional text).
+                """
+
+
+            # Wrap LLM with structured output
+            
+            system_message =  SystemMessage(content=sys_msg)
+            human_message = HumanMessage(content=prompt)
+            response = structured_llm.invoke([system_message, human_message]) #response = set of responses \n sepearate
+            print(f"Loading {page_no+1}/{total_pages}.....")
+            print(page)
+            print('*'*100)
+            print(response.response)
+            for label in response.response:
+              memory_inside[f"doc {i}"].update({label : page_no})
+            responses[f"doc {i}"].extend(response.response) # responses[key] = [[],[]] list of lists
+            page_no += 1
+
+    # # Combine all responses into a single string per document
+    # print("---------Sentences Extraction---------") 
+    # senteces = {}
+    # for key, value in responses.items():
+    #     senteces[key] = ""
+        
+    #     for i in range(len(value)):
+    #         senteces[key] += value[i]
+
+    # # Split the combined responses into a list of sentences per document
+    # sentences_list = {}
+    # for key, value in senteces.items():
+    #     sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+
+    sentences_list = responses
+
+    return sentences_list,memory_inside
+
+def NO_LLM_label_creation_with_memory(all_docs) -> dict:
+    """
+    Input:
+        all_docs : langchain document object
+    Output:
+        pages: dict  
+            Format: {doc 1: [page1, page2, ..., pagen], doc 2: [page1, page2, ..., pagem]}
+        responses: dict  
+            Format: {doc 1: [response1_set, response2_set, ..., responsen_set], 
+                     doc 2: [response1_set, response2_set, ..., responsem_set]}
+        senteces: dict  
+            Format: {doc 1: [sentences_set1], doc 2: [sentences_set1]}
+        sentences_list: dict  
+            Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
+
+        memory = memory['doc 0']["Confidential Information Use Restrictions"] # file no , label name ...
+    """
+
+    # Extract pages from all documents
+    print("---------Pages Extraction---------")
+    pages = {}
+    for i, doc in enumerate(all_docs):
+        pages[f"doc {i}"] = []
+        for j in doc:
+            pages[f"doc {i}"].append(j.page_content)
+    #Document obj -> text extraction
+
+    # Extract responses (headings) for each page using LLM
+    print("---------Responses Extraction---------")
+    responses = {}
+    memory_inside = {}
+    for i in range(len(pages)):
+        responses[f"doc {i}"] = []
+        memory_inside[f"doc {i}"] = {}
+        count = 0
+        page_no= 0
+        total_pages = len(pages[f"doc {i}"])
+        for page in pages[f"doc {i}"][:]:
+            
+            response = [page]
+            print(f"Loading {page_no+1}/{total_pages}.....")
+            print(page)
+            print('*'*100)
+            print(response)
+            for label in response:
+              memory_inside[f"doc {i}"].update({label : page_no})
+            responses[f"doc {i}"].extend(response) # responses[key] = [[],[]] list of lists
+            page_no += 1
+
+    # # Combine all responses into a single string per document
+    # print("---------Sentences Extraction---------") 
+    # senteces = {}
+    # for key, value in responses.items():
+    #     senteces[key] = ""
+        
+    #     for i in range(len(value)):
+    #         senteces[key] += value[i]
+
+    # # Split the combined responses into a list of sentences per document
+    # sentences_list = {}
+    # for key, value in senteces.items():
+    #     sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+
+    sentences_list = responses
+
+    return sentences_list,memory_inside
+# ----------------------------------------------------------------------------
+# 1.4.1 Make Labels -> AGENTIC
+# ----------------------------------------------------------------------------
+def agentic_label_creation(all_docs_splits,deep_level = "high") -> dict:
+    """
+    STILL DEVELOPMENT ----------------->
+    """
+
+    semantic_labeling_prompt = """
+    You are a semantic labeling agent. Your task is to generate 1–3 high-level, generalized labels for the given text that:
+    - Capture the key entities or concepts and their roles/actions, without relying on exact names, dates, or numbers.
+    - Focus on the semantics: what is happening, what roles exist, and what attributes or outcomes are important.
+    - Preserve important relationships or statuses 
+    - Ensure the labels are concise, consistent, and abstract enough to match similar content in other contexts even if names, numbers, or dates differ.
+    - Do NOT omit critical conceptual information.
+    - Output only the labels as a numbered list.
+    """
+
+    chunk_summary = """
+    You are the steward of a group of chunks, where each chunk represents a document we walkthrough
+    Generate a very brief, 1 to 2,3-sentence summary that explains what the chunk  is about.
+    The summary should:
+    - Capture the main topic or concept of the chunk .
+    - Include any clarifying instructions for what to add or consider in the chunk.
+    - Be generalizable, so similar content in other contexts can be recognized.
+    Only respond with the new chunk summary, nothing else.
+    """
+
+    # Create a chat prompt template to compare two contexts
+    tagging_prompt = ChatPromptTemplate.from_template("""
+    You are given a chunk of  a whole pdf document. Your task is to:
+    Logically think about the desired information from the following passage.
+    Only think about the properties mentioned in the 'Classification' function.
+
+    Passage:
+    Context 1:
+    {context1}
+
+    """)
+
+    # Define the structured output schema
+    class Classification(BaseModel):
+        chunks: List[str] = Field(
+            description= semantic_labeling_prompt
+        )
+        summarization: str = Field(
+            description=chunk_summary
+        )
+
+    # Wrap LLM with structured output
+    structured_llm = llm.with_structured_output(Classification)
+
+    #deep_level = "high"
+    sys_msg = build_system_message(deep_level)
+
+    # Extract responses (headings) for each page using LLM
+    print("---------Responses Extraction---------")
+    responses = {}
+    for key,value in all_docs_splits.items():
+        responses[key] = []
+        for chunk in value[:]:
+            prompt = f"""
+            You need to understand the content of this page: {chunk}
+
+            Think about what aspects could differ if the same topic appeared in another similar document.
+            Based only on this page and your careful understanding, identify the **LABELS** that describe possible differences to check. Make the LABELS more detailed.
+            List **only** the LABELS, without any explanations or details.
+            """
+            system_message =  SystemMessage(content=sys_msg)
+            human_message = HumanMessage(content=prompt)
+            prompt = tagging_prompt.invoke({"context1": chunk})
+            response =  structured_llm.invoke(prompt)
+            responses[key].append(response.chunks)
 
     # Combine all responses into a single string per document
     print("---------Sentences Extraction---------")
@@ -351,7 +641,7 @@ def label_creation(all_docs) -> dict:
 # ----------------------------------------------------------------------------
 # 1.5 Extract the Mapping labels
 # ----------------------------------------------------------------------------
-def mapping_labels(labels):
+def mapping_labels(labels,threshold=0.5,k=3):
     """
     Input:
         labels: dict  
@@ -378,12 +668,13 @@ def mapping_labels(labels):
 
     # Get top k matches per row based on similarity
     comparing_headings = []
-    t = 0.5  # similarity threshold
-    values, indices = torch.topk(similarities, k=1, dim=1)  
+    t = threshold # similarity threshold
+    values, indices = torch.topk(similarities, k=k, dim=1)  
     # values: highest similarity scores, indices: corresponding indices
     indices = indices.tolist()  # [[i00, i01, i02], [i10, i11, i12], ...]
     values = values.tolist()    # [[v00, v01, v02], [v10, v11, v12], ...]
 
+    # NUM_OF_LABELS_SELECTED_FOR_EACH NOT ACTIVELY FUNCTION YET  
     for i in range(len(indices)):
         # Skip if the top similarity score is below threshold
         if values[i][0] < t:
@@ -451,6 +742,76 @@ def labelized_llm(context1, context2):
     print(response)
     return response
 
+# Retrieve top-k relevant documents for a pair of labels
+def get_topk_docs(pair, k=5,data=None,memory=None,type_is=None,retrievers=None):
+
+   
+    # pair = [label_doc1, label_doc2]
+    # Restrict type_is to only two allowed values
+    allowed_types = ["sementic_search", "label_bind", "both"]
+
+     # Function to format document pages as a single string
+    format_docs = lambda docs: "\n\n".join([d.page_content for d in docs])
+
+    if type_is.lower() not in allowed_types:
+        raise ValueError(f"type_is must be one of {allowed_types}, got '{type_is}'")
+
+    if type_is == "sementic_search":
+        docs1 = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
+        docs2 = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
+        docs1_f = format_docs(docs1)
+        docs2_f = format_docs(docs2)
+    elif type_is == "label_bind":
+        # some other logic for type2
+        docs1 = data[0][memory['doc 0'][pair[0]]]
+        docs2 = data[1][memory['doc 1'][pair[1]]]
+        docs1_f = docs1.page_content
+        docs2_f = docs2.page_content
+    elif type_is == "both":
+        # some other logic for type2
+        docs1_sementic = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
+        docs2_sementic = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
+        docs1_f_sementic = format_docs(docs1)
+        docs2_f_sementic = format_docs(docs2)
+
+        docs1_label_bind = data[0][memory['doc 0'][pair[0]]]
+        docs2_label_bind = data[1][memory['doc 1'][pair[1]]]
+        docs1_f_label_bind = docs1.page_content
+        docs2_f_label_bind = docs2.page_content
+
+        docs1_f = docs1_f_sementic + docs1_f_label_bind
+        docs2_f = docs2_f_sementic + docs2_f_label_bind
+
+    return docs1, docs2
+
+def make_alldocs_as_document_object(extracted_file_contents, page_size=500):
+    """
+        extracted_file_contents = [[fileid,filename,filecontent]]
+    """
+    print("make_alldocs_as_document_object")
+    all_docs = []
+    for file_content in extracted_file_contents:
+        print("file processing: ",file_content[:2]) # file name and id
+
+    for file_content in extracted_file_contents:
+        file_content = file_content[2] # just to extract the content
+        doc_pages = [Document(
+            page_content=file_content[i:i+page_size],
+            metadata={"source": "user_input", "length": page_size}
+        ) for i in range(0, len(file_content), page_size)]
+        all_docs.append(doc_pages)
+    return all_docs
+
+def get_files_from_local_dir_pypdf(folder_path="/home/tharaka/thakshana/doc_comparison/data"):
+    all_docs = []
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".pdf"):
+            loader = PyPDFLoader(os.path.join(folder_path, filename))
+            docs = loader.load()
+            all_docs.append(docs)  # append all pages to the main list
+    return all_docs
+
+    
 # ----------------------------------------------------------------------------
 # 1.7 Main comparison function
 # ----------------------------------------------------------------------------
@@ -464,28 +825,25 @@ def compare_documents(extracted_file_contents: list):
             Concatenated reasons for contradictions detected between document pairs.
     """
 
-    print("---------STARTED---------")
+    
 
-    print("---------LLM/Embeddings Initialization---------")
+    print("---------STARTED---------")
+    file_names_processing = []
+    for file_content in extracted_file_contents:
+        file_names_processing = extracted_file_contents[1]+extracted_file_contents[0] # extracted_file_contents =  ['61c701ba-91a3-480b-a283-145fc6298f4b', '130806ca141 test 1.pdf',"content"]
 
     print("---------Document Extraction---------")
     # Get the documents from the folder
-    folder_path = "/home/tharaka/thakshana/doc_comparison/data"  # folder containing all PDFs
+
     all_docs = []
-
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".pdf"):
-            loader = PyPDFLoader(os.path.join(folder_path, filename))
-            docs = loader.load()
-            all_docs.append(docs)  # append all pages to the main list
-
+    all_docs = make_alldocs_as_document_object(extracted_file_contents,page_size = PAGE_SIZE_FOR_CHUNKING)
     print(f"Loaded a total of {len(all_docs)} documents")
-
+    
     # Only take the first 2 pages from each document for testing
     #all_docs = [l[:2] for l in all_docs]
 
     print("---------Split Creation---------")
-    all_docs_splits = agentic_split_creation(all_docs)
+    all_docs_splits = split_creation(all_docs)
 
     print("---------Vectorstores Creation---------")
     all_docs_vectorstores = vectorstores_creation(all_docs_splits, embedding_model)
@@ -497,29 +855,23 @@ def compare_documents(extracted_file_contents: list):
 
     print("---------Label Creation---------")
     # Extract labels/sentences from documents
-    labels = label_creation(all_docs)  # sentences_list: dict {doc 1:[sentence1,...], doc 2:[sentence1,...]}
+   
+   # labels = label_creation(all_docs)  # sentences_list: dict {doc 1:[sentence1,...], doc 2:[sentence1,...]}
+
+    #labels,memory = label_creation_with_memory(all_docs,DEEP_LEVEL) 
+
+    labels,memory = NO_LLM_label_creation_with_memory(all_docs)
     l1 = len(labels["doc 1"])
     l0 = len(labels["doc 0"])
     details = f"Labels created by doc0 {l1}\n Labels created by doc1 {l0}\n"
 
     print("---------Similarity Calculation---------")
-    comparing_headings = mapping_labels(labels)
+    comparing_headings = mapping_labels(labels,threshold=THRESHOLD_FOR_LABEL_SELECTION,k=NUM_OF_LABELS_SELECTED_FOR_EACH)
     details += f"Total labels Compared: {len(comparing_headings)} \n "
     #### RETRIEVAL and GENERATION ####
 
-    # Function to format document pages as a single string
-    format_docs = lambda docs: "\n\n".join([d.page_content for d in docs])
-
-    # Retrieve top-k relevant documents for a pair of labels
-    def get_topk_docs(pair, k=5):
-        docs1 = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
-        docs2 = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
-        return docs1, docs2
-
-    
-
     # File path to save CSV results
-    output_file = os.path.join(folder_path, "doc_pair_comparison_results.csv")
+    output_file = os.path.join(LOCAL_FOLDER_PATH, "doc_pair_comparison_results.csv")
 
     # Write CSV header
     with open(output_file, mode='w', newline='', encoding='utf-8') as f:
@@ -530,10 +882,8 @@ def compare_documents(extracted_file_contents: list):
     # Compare first n pairs of headings
     for pair in comparing_headings[:]:
         print(pair)
-        docs1, docs2 = get_topk_docs(pair)
-        docs1_f = format_docs(docs1)
-        docs2_f = format_docs(docs2)
-
+        docs1_f, docs2_f = get_topk_docs(pair,k=NUM_OF_CHUNKS_RETRIVE_FOR_EACH_LABEL, type_is=TYPE_OF_CHUNK_RETRIEVAL,data = all_docs,memory=memory,retrievers=retrievers)
+        
         # Get LLM response for the document pair
         response = labelized_llm(docs1_f, docs2_f)
         print(response)
@@ -817,7 +1167,7 @@ class Pipeline:
 
             #To use ollama cloud models
             model="gpt-oss:120b",
-            api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+            api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk",  # pass api key in directly instaed of using env vars
             base_url="https://ollama.com/v1",
             
             # #To use llama.cpp models
@@ -846,7 +1196,7 @@ class Pipeline:
 
             #To use ollama cloud models
             model="gpt-oss:120b",
-            api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+            api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk",  # pass api key in directly instaed of using env vars
             base_url="https://ollama.com/v1",
             
             # #To use llama.cpp models
@@ -867,7 +1217,7 @@ class Pipeline:
 
             #To use ollama cloud models
             model="gpt-oss:120b",
-            api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+            api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk",  # pass api key in directly instaed of using env vars
             base_url="https://ollama.com/v1",
             
             # #To use llama.cpp models
@@ -1003,7 +1353,7 @@ class Pipeline:
 
             #To use ollama cloud models
             model="gpt-oss:120b",
-            api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # if you prefer to pass api key in directly instaed of using env vars
+            api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk", 
             base_url="https://ollama.com/v1",
             
             # #To use llama.cpp models
