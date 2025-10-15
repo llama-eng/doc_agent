@@ -10,6 +10,7 @@ import os
 import re
 import csv
 from typing import List, Union, Generator, Iterator, Optional, ClassVar
+from typing import List, Dict, Tuple
 from typing_extensions import TypedDict, Literal
 
 # Third-party imports
@@ -53,7 +54,6 @@ import time
 
 ######################################################### Things to do #########################################################
 """
-1. w/o making labels through llm let labels be the same chunk for efficiency and check the correctness
 2. use the same agentic chunks to used to create labels 
 
 issues
@@ -63,102 +63,162 @@ If the files won't uploaded but choose from panel it will update the swagger be 
 ######################################################### Things to do #########################################################
 
 
-# Initialize Langfuse CallbackHandler for Langchain (tracing)
+################################################################################################################
+#                                               INITIALIZATION
+################################################################################################################
+
+# ----------------------------------------------------------------------------
+# 1. Langfuse Callback Handler for LangChain Tracing
+# ----------------------------------------------------------------------------
+# Used for tracing LLM calls, logging, and debugging within LangChain pipelines.
 langfuse_handler = CallbackHandler()
-#Initialize the llm as openai based api from ollama cloud models
+
 #api_key = "78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF"
-
-# Tune up params
-THRESHOLD_FOR_LABEL_SELECTION = 0.7 # low means farther away labels also be considered
-TYPE_OF_CHUNK_RETRIEVAL = "label_bind" # ["sementic_search", "label_bind", "both"]
-PAGE_SIZE_FOR_CHUNKING = 500 # CHARS
-LOCAL_FOLDER_PATH = "/home/tharaka/thakshana/doc_comparison/data"
-DEEP_LEVEL = 'safe'
-MODEL = "gpt-oss:120b"  # available models = ["deepseek-v3.1:671b-cloud", "gpt-oss:20b-cloud", "gpt-oss:120b-cloud", "kimi-k2:1t-cloud", "qwen3-coder:480b-cloud"]
-NUM_OF_CHUNKS_RETRIVE_FOR_EACH_LABEL = 5 #
-NUM_OF_LABELS_SELECTED_FOR_EACH = 1 #
-
+# ----------------------------------------------------------------------------
+# 2. LLM Initialization (Ollama Cloud)
+# ----------------------------------------------------------------------------
+# Configure the LLM with Ollama cloud models. You can pass the API key directly
+# or use environment variables. Adjust model parameters as needed.
+MODEL = "gpt-oss:120b"  # Available models: ["deepseek-v3.1:671b-cloud", "gpt-oss:20b-cloud", "gpt-oss:120b-cloud", "kimi-k2:1t-cloud", "qwen3-coder:480b-cloud"]
 
 llm = ChatOpenAI(
     model=MODEL,
-    api_key="89faf3ae18ef4693bc964f3deca63919.2qaqcagLcSilt0trMvydIdGk",  # if you prefer to pass api key in directly instaed of using env vars
+    api_key="78a7821bbadc498b9938a40aeddeb87b.CRx89un9mZspHxQblP6HbuCF",  # optional, or set via env
     base_url="https://ollama.com/v1",
+    # Optional tuning parameters:
     # temperature=0,
     # max_tokens=None,
     # timeout=None,
     # max_retries=2,
     # organization="...",
-    # other params...
 )
-    
+
+# ----------------------------------------------------------------------------
+# 3. Embedding Model Setup
+# ----------------------------------------------------------------------------
+# Using HuggingFace all-MiniLM-L6-v2 for generating embeddings for labels and chunks
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-memory = {}
-all_docs_global = []
-################################################ 1 Core Functionalities of a Document Comparison Agent ######################################################
-        
+
 # ----------------------------------------------------------------------------
-# 1.10 Make Chunks -> recursive chunk creation
+# 4. Pipeline Hyperparameters
 # ----------------------------------------------------------------------------
-def split_creation(all_docs) -> dict:
+THRESHOLD_FOR_LABEL_SELECTION = 0.5  # Minimum similarity score to match labels (lower = more permissive)
+TYPE_OF_CHUNK_RETRIEVAL = "label_bind"  # ["semantic_search", "label_bind", "both"]
+PAGE_SIZE_FOR_CHUNKING = 2000  # Number of characters per simulated page when chunking raw text
+DEEP_LEVEL = 'safe'  # Level of label extraction detail
+NUM_OF_CHUNKS_RETRIVE_FOR_EACH_LABEL = 5  # Top-k chunks to retrieve per label
+NUM_OF_LABELS_SELECTED_FOR_EACH = 1  # How many top labels to select for comparison
+
+# ----------------------------------------------------------------------------
+# 5. Local Paths and Memory
+# ----------------------------------------------------------------------------
+LOCAL_FOLDER_PATH = "/home/tharaka/thakshana/doc_comparison/data"  # Folder with PDF files
+memory = {}  # Will store mapping: label → page index
+all_docs_global = []  # Global storage for all processed documents
+
+
+################################################################################################################
+#                            DOCUMENT COMPARISON AGENT
+################################################################################################################
+
+
+
+##############################################################
+# 1. CHUNK CREATION
+##############################################################
+
+# ----------------------------------------------------------------------------
+# 1.1 Recursive Chunking
+# ----------------------------------------------------------------------------
+def split_creation(
+    all_docs: List[List[Document]],
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+    debug: bool = True
+) -> Dict[str, List[Document]]:
     """
-    Input:
-        all_docs : langchain document object
-    Output:
-        all_docs_splits_f : dict  
-            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]} # each split is document object it self
+    Split LangChain Document objects into smaller chunks using RecursiveCharacterTextSplitter.
+
+    Args:
+        all_docs (List[List[Document]]): Nested list of LangChain Document objects.
+            Each sublist corresponds to a document and contains page-level Document objects.
+        chunk_size (int, optional): Maximum number of characters per chunk. Defaults to 1000.
+        chunk_overlap (int, optional): Number of overlapping characters between chunks. Defaults to 200.
+        debug (bool, optional): If True, print debug info and example splits. Defaults to False.
+
+    Returns:
+        Dict[str, List[Document]]: Dictionary of split documents.
+            Format: { "doc 0": [split1, split2, ...], "doc 1": [split1, split2, ...] }
+            Each split is a Document object.
     """
 
-    print("---------Splits Creation---------")
-    all_docs_splits = {}
+    all_docs_splits: Dict[str, List[Document]] = {}
 
     for i, doc in enumerate(all_docs):
-        # Initialize text splitter with chunk size 1000 and overlap 200
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
         splits = text_splitter.split_documents(doc)
         all_docs_splits[f"doc {i}"] = splits
 
-    print(len(all_docs_splits))
-    # all_docs_splits -> {doc 1: [all the splits as list], doc 2: [all the splits as list]}
-    print("Splits :\n", all_docs_splits["doc 0"][0], all_docs_splits["doc 1"][0], "......")  
-    # show split of a selected doc
+    if debug:
+        print(f"Total documents split: {len(all_docs_splits)}")
+        for key, value in all_docs_splits.items():
+            print(f"{key}: {len(value)} splits created")
+        # Example of first splits
+        # for doc_key in list(all_docs_splits.keys())[:2]:
+        #     print(f"Sample split for {doc_key}: {all_docs_splits[doc_key][0]}")
 
-    for key, value in all_docs_splits.items():
-        print(key, ": NO of splits created", len(value))
-
-
-    
     return all_docs_splits
 
-## ----------------------------------------------------------------------------
-# 1.11 Make Chunks -> agentic chunk creation
 # ----------------------------------------------------------------------------
-def agentic_split_creation(all_docs) -> dict:
+# 1.2 Agentic Chunking (Semantic / LLM-based)
+# ----------------------------------------------------------------------------
+def agentic_split_creation(
+    all_docs: List[List[Document]],
+    debug: bool = False,
+    use_context2: bool = False
+) -> Dict[str, List[Document]]:
     """
-    Input:
-        all_docs : langchain document object
-    Output:
-        splits : dict  
-            Format: {doc 1: [split1, split2, ..., splitn], doc 2: [split1, split2, ..., splitm]}
+    Agentic chunking of LangChain Document pages using an LLM.
+
+    Args:
+        all_docs (List[List[Document]]): Nested list of Document objects (pages per doc).
+        debug (bool, optional): If True, prints debug info. Defaults to False.
+        use_context2 (bool, optional): If True, uses previous/next page context. Defaults to False.
+
+    Returns:
+        Dict[str, List[Document]]: Dictionary of agentically split Document objects.
+            Format: { "doc 0": [chunk1, chunk2, ...], "doc 1": [chunk1, chunk2, ...] } each chunks are document object it self
     """
 
-    print("---------Agentic Splits Creation---------")
-    all_docs_splits = {}
-
+    # Chunking instructions aimed at semantic differences
+    chunking_prompt = """
+    You are a semantic chunking agent. Divide the given page into chunks based on **meaning and conceptual differences**:
+    - Identify distinct semantic ideas, topics, or points of discussion.
+    - Each chunk should represent a coherent concept or argument.
+    - Preserve all information; do NOT omit any sentences, numbers, names, or details.
+    - Maintain the original order of content.
+    - Avoid arbitrary splits based on length; only split when the meaning shifts.
+    - Minimize the number of chunks while ensuring each captures a unique semantic point.
+    - Output a list of chunks (no summaries, labels, or explanations).
+    """
     chunking_prompt_a = """
-    You are a chunking agent. Your task is to divide the given page (Context 1) into several logical chunks. 
-    - Create boundaries only where necessary, based on the content’s meaning. 
-    - Remove unnecessary indentations as they do not affect the main idea. 
+    You are a chunking agent. Your task is to divide the given page (Context 1) into several logical chunks.
+    - Create boundaries only where necessary, based on the content’s meaning.
+    - Remove unnecessary indentations as they do not affect the main idea.
     - Ensure each chunk represents a coherent section of the text.
     """
     chunking_prompt_b = """
         You are a chunking agent. Your task is to divide the given page (Context 1) into several logical chunks.
-        - Create boundaries only where necessary, based on the content’s meaning. 
+        - Create boundaries only where necessary, based on the content’s meaning.
         - Remove unnecessary indentations as they do not affect the main idea.
         - Ensure each chunk represents a coherent section of the text.
         - Do NOT omit, summarize, or ignore any information from the context.
         - Every sentence, number, date, name, or detail must be preserved in its entirety within the chunks.
         - Maintain the original order of the content within and across chunks.
-        - Try to use lesser no of chunking as possible 
+        - Try to use lesser no of chunking as possible
             EX:
                 3.2. GPT-3
             Launched in 2020, GPT-3 is the third and most advanced version of the GPT series, featuring several enhancements over GPT-2. GPT-3 is pretrained on a massive dataset called the WebText2, which contains hundreds of gigabytes of text from diverse sources, including web pages, books, and articles [111]. The model is significantly larger than GPT-2, with 175 billion parameters, making it one of the largest AI language models available. GPT-3 excels at various NLP tasks, such as text generation, summarization, translation, and code generation, often with minimal fine-tuning. The model's size and complexity allow it to generate more coherent, context-aware, and human-like text compared to GPT-2. GPT-3 is available through the OpenAI API, enabling developers and researchers to access the model for their applications [112].
@@ -178,101 +238,140 @@ def agentic_split_creation(all_docs) -> dict:
 
             we can have all of the above into one chunk
         """
-    # Create a chat prompt template to compare two contexts
+
+    chunking_prompt_c = """
+        You are a **Chunking Agent**, specialized in dividing text into semantically coherent sections.
+
+        Your goal is to divide the given text (Context 1) into the *smallest necessary number of chunks* while ensuring each chunk is complete and meaningful.
+
+        ### STRICT INSTRUCTIONS:
+
+        1. **Do not omit or summarize** any information.  
+        Every word, number, name, and symbol from the original text must appear in your output.
+
+        2. **Preserve full sentences and paragraphs.**  
+        Never cut through a sentence or word (e.g., avoid “moneti- zation”).  
+        Join broken or hyphenated words if they belong together.
+
+        3. **Use as few chunks as possible** while keeping logical coherence.  
+        Only split when there is a clear semantic or structural boundary (e.g., heading change, list start, or topic shift).
+
+        4. **Remove unnecessary indentation or line breaks** that do not affect meaning.
+
+        5. Do not include any explanations or commentary outside the chunks.
+
+
+        """
+
+    # Structured output schema
+    class Classification(BaseModel):
+        chunks: List[str] = Field(description=chunking_prompt_c)
+
+    structured_llm = llm.with_structured_output(Classification)
+
     tagging_prompt = ChatPromptTemplate.from_template("""
-    You are given two contexts 
-    Context 1:Current page to analyze:.
-    Context 2: Context (for understanding only the previous and next pages)
+    Context 1: Current page to analyze
+    Context 2: {context2}
 
     Passage:
-    Context 1:
     {context1}
-
-    Context 2:
-    {context2}
-
-
     """)
 
-    # Define the structured output schema
-    class Classification(BaseModel):
-            chunks: List[str] = Field(
-                description=chunking_prompt_b
-            )
-    # Wrap LLM with structured output
-    structured_llm = llm.with_structured_output(Classification)
-  
+    all_docs_splits_f: Dict[str, List[Document]] = {}
 
-    splits = []
+    for doc_idx, doc in enumerate(all_docs):
+        doc_splits: List[Document] = []
 
-    for i, doc in enumerate(all_docs):
-        # Initialize text splitter with chunk size 1000 and overlap 200
+        for page_no, page in enumerate(doc):
+            context2_text = "None"
+            if use_context2:
+                prev_page = doc[page_no - 1].page_content if page_no > 0 else ""
+                next_page = doc[page_no + 1].page_content if page_no < len(doc) - 1 else ""
+                context2_text = prev_page + "\n" + next_page
 
-        for page in doc[:]:
-       
-            prompt = tagging_prompt.invoke({"context1": page.page_content, "context2": "None"}) #use context two if we need to provide an additonal overview
+            prompt = tagging_prompt.invoke({"context1": page.page_content, "context2": context2_text})
+            print(f"Processing : {page_no+1}/{len(doc)}")   
             response = structured_llm.invoke(prompt)
-            splits.append(response)
+            print(f"Doc {doc_idx} Page {page_no} → {len(response.chunks)} chunks")
 
-        all_docs_splits[f"doc {i}"] = splits
+            # Convert chunks into Document objects
+            for chunk_text in response.chunks:
+                doc_splits.append(Document(
+                    page_content=chunk_text,
+                    metadata={"source": "user_input", "length": len(chunk_text)}
+                ))
 
-    print(len(all_docs_splits))
-    # all_docs_splits -> {doc 1: [all the splits as list], doc 2: [all the splits as list]}
-    print("Splits :\n", all_docs_splits["doc 0"][0])  
-    # show split of a selected doc
+            if debug:
+                print(f"Doc {doc_idx} Page {page_no} → {len(response.chunks)} chunks")
+                print("-" * 100)
 
-    for key, value in all_docs_splits.items():
-        print(key, ": NO of splits created", len(value))
+        all_docs_splits_f[f"doc {doc_idx}"] = doc_splits
 
-        # make the same format previously udes in splits
-    all_docs_splits_merged = {}
-    for key, value in all_docs_splits.items():
-        all_docs_splits_merged[key] = []
-        for i in value:
-            print(i.chunks)
-            all_docs_splits_merged[key] += i.chunks
-        
-    all_docs_splits = all_docs_splits_merged
+    if debug:
+        for key, value in all_docs_splits_f.items():
+            print(f"{key}: {len(value)} chunks created")
 
-    all_docs_splits_f = {}
-    for key, value in all_docs_splits.items():
-      all_docs_splits_f[key] = []
-      for each in value:
-        all_docs_splits_f[key].append(Document(
-            page_content=each,
-            metadata={"source": "user_input", "length": len(each)}
-        ))
     return all_docs_splits_f
 
+
+##############################################################
+# 2. VECTOR EMBEDDINGS
+##############################################################
+
 # ----------------------------------------------------------------------------
-# 1.2 Make Embeddings and Store within Vectorspaces
+# 2.1 Create Chroma Vectorstores
 # ----------------------------------------------------------------------------
-def vectorstores_creation(all_docs_splits, embedding_model) -> dict:
+def vectorstores_creation(
+    all_docs_splits: Dict[str, list[Document]],
+    embedding_model
+) -> Dict[str, Chroma]:
+
     """
-    Input:
-        all_docs_splits : langchain splits
-    Output:
-        vectorstores : dict  
-            Format: {vectorstore 1: [Embed1, Embed2, ..., Embedn], vectorstore 2: [Embed1, Embed2, ..., Embedm]}
+    Create Chroma vector stores for each set of document splits.
+
+    Args:
+        all_docs_splits (Dict[str, List[Document]]): 
+            Dictionary of document splits.
+            Format: { "doc 0": [split1, split2, ...], "doc 1": [split1, ...] }
+        embedding_model: LangChain-compatible embedding model.
+
+    Returns:
+        Dict[str, Chroma]: Dictionary of Chroma vectorstores.
+            Format: { "doc 0": Chroma_vectorstore, "doc 1": Chroma_vectorstore, ... }
+
+    Notes:
+        - Each vectorstore is persisted in a unique directory.
+        - Existing directories are removed before creating a new vectorstore.
     """
 
-    # Create vector embeddings for each document split
     print("---------Vectorstores Creation---------")
-    vectorstores = {}
-    var = int(time.time())
-    for key, value in all_docs_splits.items():
-        persist_dir = f"./db_file{key}{var}"
+    vectorstores: Dict[str, Chroma] = {}
+    timestamp = int(time.time())
 
-        # --- Remove old DB directory if it exists ---
+    for doc_key, splits in all_docs_splits.items():
+        persist_dir = f"./db_file_{doc_key}_{timestamp}"
+
+        # Remove old DB directory if it exists
         if os.path.exists(persist_dir):
-            shutil.rmtree(persist_dir)  # deletes all old data
-            print("Delete the exsisting DB")
-        vectorstores[key] = Chroma.from_documents(documents=value, embedding=embedding_model,persist_directory=persist_dir)
+            shutil.rmtree(persist_dir)
+            print(f"Deleted existing DB at {persist_dir}")
+
+        # Create Chroma vectorstore for this document
+        vectorstores[doc_key] = Chroma.from_documents(
+            documents=splits,
+            embedding=embedding_model,
+            persist_directory=persist_dir
+        )
+        print(f"Vectorstore created for {doc_key} with {len(splits)} splits.")
 
     return vectorstores
 
+##############################################################
+# 3. LABEL EXTRACTION
+##############################################################
+
 # ----------------------------------------------------------------------------
-# 1.3 Make the system prompt -> prompt tune is  needed after testing
+# 3.1 Build System Message for LLM
 # ----------------------------------------------------------------------------
 def build_system_message(deep_level):
     base_message = (
@@ -321,8 +420,9 @@ def build_system_message(deep_level):
 
     return base_message + level_details + example
 
+
 # ----------------------------------------------------------------------------
-# 1.4 Make Labels
+# 3.2 Label Creation (LLM or Non-LLM)
 # ----------------------------------------------------------------------------
 def label_creation(all_docs,deep_level = "high") -> dict:
     """
@@ -387,434 +487,558 @@ def label_creation(all_docs,deep_level = "high") -> dict:
 
     return sentences_list
 
-def label_creation_with_memory(all_docs,deep_level = "high") -> dict:
+
+def label_creation_with_memory(
+    all_docs: List[List[Document]],
+    deep_level: str = "high"
+) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, int]]]:
     """
-    Input:
-        all_docs : langchain document object
-    Output:
-        pages: dict  
-            Format: {doc 1: [page1, page2, ..., pagen], doc 2: [page1, page2, ..., pagem]}
-        responses: dict  
-            Format: {doc 1: [response1_set, response2_set, ..., responsen_set], 
-                     doc 2: [response1_set, response2_set, ..., responsem_set]}
-        senteces: dict  
-            Format: {doc 1: [sentences_set1], doc 2: [sentences_set1]}
-        sentences_list: dict  
-            Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
+    Extract descriptive labels from document pages using an LLM and build memory mapping.
 
-        memory = memory['doc 0']["Confidential Information Use Restrictions"] # file no , label name ...
+    Args:
+        all_docs (list[list[Document]]): Nested list of LangChain Document objects.
+            Each sublist corresponds to a document and contains page-level Document objects.
+        deep_level (str, optional): Level of detail for system message instructions. Defaults to "high".
+
+    Returns:
+        sentences_list (dict): Labels extracted from each document.
+            Format: { "doc 0": [label1, label2, ...], "doc 1": [label1, ...] }
+        memory_inside (dict): Maps each label to its corresponding page number.
+            Format: { "doc 0": {label1: page_no, label2: page_no, ...}, ... }
+
+    Notes:
+        - Uses structured output via Pydantic BaseModel for LLM responses.
+        - Each label is mapped to the page number it was extracted from.
+        - Designed to work with LangChain LLMs supporting structured output.
     """
-
-
-    # Define the structured output schema
+    
+    # Define the structured output schema for LLM
     class Classification(BaseModel):
         response: List[str] = Field(
-            description="List **only** the LABELS, without any explanations or details. as a list"
+            description="List of LABELS extracted from page (no explanations)."
         )
 
     structured_llm = llm.with_structured_output(Classification)
 
+    # Build system message based on desired detail level
     sys_msg = build_system_message(deep_level)
-    # Extract pages from all documents
+
+    # --- Step 1: Extract pages from all documents ---
     print("---------Pages Extraction---------")
     pages = {}
-    for i, doc in enumerate(all_docs):
-        pages[f"doc {i}"] = []
-        for j in doc:
-            pages[f"doc {i}"].append(j.page_content)
-    #Document obj -> text extraction
+    for doc_idx, doc in enumerate(all_docs):
+        pages[f"doc {doc_idx}"] = [page.page_content for page in doc]
 
-    # Extract responses (headings) for each page using LLM
+    # --- Step 2: Extract labels for each page using LLM ---
     print("---------Responses Extraction---------")
     responses = {}
     memory_inside = {}
-    for i in range(len(pages)):
-        responses[f"doc {i}"] = []
-        memory_inside[f"doc {i}"] = {}
-        count = 0
-        page_no= 0
-        total_pages = len(pages[f"doc {i}"])
-        for page in pages[f"doc {i}"][:]:
-            
+
+    for doc_idx, page_contents in pages.items():
+        responses[doc_idx] = []
+        memory_inside[doc_idx] = {}
+        total_pages = len(page_contents)
+
+        for page_no, page_text in enumerate(page_contents):
             prompt = f"""
-                You are given the following page content:
-                {page}
+            You are given the following page content:
+            {page_text}
 
-                Your task:
-                1. Carefully read and understand the content of this page.
-                2. Ignore any irrelevant characters, extra newlines, or formatting artifacts not intended to be part of the document.
-                3. Think critically about how this page’s content might differ if the same topic appeared in another, similar document.
-                4. Based solely on this page, identify detailed and descriptive **LABELS** representing possible aspects or points of difference to check.
+            Your task:
+            1. Carefully read and understand the content of this page.
+            2. Ignore irrelevant characters, extra newlines, or formatting artifacts.
+            3. Think critically about how this page’s content might differ if the same topic appeared in another similar document.
+            4. Based solely on this page, identify detailed and descriptive **LABELS** representing possible aspects or points of difference to check.
 
-                Output:
-                - Provide **only** a list of LABELS (no explanations, reasoning, or additional text).
-                """
+            Output:
+            - Provide **only** a list of LABELS (no explanations or reasoning).
+            """
 
-
-            # Wrap LLM with structured output
-            
-            system_message =  SystemMessage(content=sys_msg)
+            system_message = SystemMessage(content=sys_msg)
             human_message = HumanMessage(content=prompt)
-            response = structured_llm.invoke([system_message, human_message]) #response = set of responses \n sepearate
+            
+            # Invoke structured LLM
+            response = structured_llm.invoke([system_message, human_message])
+
+            # Debugging output
             print(f"Loading {page_no+1}/{total_pages}.....")
-            print(page)
-            print('*'*100)
+            print(page_text)
+            print('*' * 100)
             print(response.response)
+
+            # Update memory mapping and responses
             for label in response.response:
-              memory_inside[f"doc {i}"].update({label : page_no})
-            responses[f"doc {i}"].extend(response.response) # responses[key] = [[],[]] list of lists
-            page_no += 1
+                memory_inside[doc_idx][label] = page_no
+            responses[doc_idx].extend(response.response)
 
-    # # Combine all responses into a single string per document
-    # print("---------Sentences Extraction---------") 
-    # senteces = {}
-    # for key, value in responses.items():
-    #     senteces[key] = ""
-        
-    #     for i in range(len(value)):
-    #         senteces[key] += value[i]
-
-    # # Split the combined responses into a list of sentences per document
-    # sentences_list = {}
-    # for key, value in senteces.items():
-    #     sentences_list[key] = [line for line in value.split("\n") if line.strip()]
-
+    # Final outputs
     sentences_list = responses
+    return sentences_list, memory_inside
 
-    return sentences_list,memory_inside
 
-def NO_LLM_label_creation_with_memory(all_docs) -> dict:
+def NO_LLM_label_creation_with_memory(
+    all_docs: List[List[Document]]
+) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, int]]]:
     """
-    Input:
-        all_docs : langchain document object
-    Output:
-        pages: dict  
-            Format: {doc 1: [page1, page2, ..., pagen], doc 2: [page1, page2, ..., pagem]}
-        responses: dict  
-            Format: {doc 1: [response1_set, response2_set, ..., responsen_set], 
-                     doc 2: [response1_set, response2_set, ..., responsem_set]}
-        senteces: dict  
-            Format: {doc 1: [sentences_set1], doc 2: [sentences_set1]}
-        sentences_list: dict  
-            Format: {doc 1: [sentence1, sentence2, ..., sentencen], doc 2: [sentence1, sentence2, ..., sentencem]}
+    Extract page-level 'labels' without using an LLM and create a memory mapping.
 
-        memory = memory['doc 0']["Confidential Information Use Restrictions"] # file no , label name ...
+    Args:
+        all_docs (List[List[Document]]): Nested list of LangChain Document objects.
+            Each sublist corresponds to a document containing page-level Document objects.
+
+    Returns:
+        sentences_list (Dict[str, List[str]]): Page-level text for each document.
+            Format: { "doc 0": [page1, page2, ...], "doc 1": [page1, ...] }
+        memory_inside (Dict[str, Dict[str, int]]): Maps each page text to its page number.
+            Format: { "doc 0": {page_text1: page_no, page_text2: page_no, ...}, ... }
+
+    Notes:
+        - This function does not call an LLM.
+        - Each page's content is used as a 'label'.
+        - Useful for testing or pipelines where LLM processing is not required.
     """
 
-    # Extract pages from all documents
+    # --- Step 1: Extract pages from documents ---
     print("---------Pages Extraction---------")
-    pages = {}
-    for i, doc in enumerate(all_docs):
-        pages[f"doc {i}"] = []
-        for j in doc:
-            pages[f"doc {i}"].append(j.page_content)
-    #Document obj -> text extraction
+    pages = {
+        f"doc {i}": [page.page_content for page in doc]
+        for i, doc in enumerate(all_docs)
+    }
 
-    # Extract responses (headings) for each page using LLM
+    # --- Step 2: Create memory mapping and responses ---
     print("---------Responses Extraction---------")
     responses = {}
     memory_inside = {}
-    for i in range(len(pages)):
-        responses[f"doc {i}"] = []
-        memory_inside[f"doc {i}"] = {}
-        count = 0
-        page_no= 0
-        total_pages = len(pages[f"doc {i}"])
-        for page in pages[f"doc {i}"][:]:
-            
-            response = [page]
-            print(f"Loading {page_no+1}/{total_pages}.....")
-            print(page)
-            print('*'*100)
+
+    for doc_idx, page_texts in pages.items():
+        responses[doc_idx] = []
+        memory_inside[doc_idx] = {}
+
+        total_pages = len(page_texts)
+
+        for page_no, page_text in enumerate(page_texts):
+            # In this version, the 'label' is just the page content itself
+            response = [page_text]
+
+            # Debug output
+            print(f"Loading {page_no + 1}/{total_pages}.....")
+            print(page_text)
             print(response)
+            print("*" * 100)
+            
+
+            # Update memory and responses
             for label in response:
-              memory_inside[f"doc {i}"].update({label : page_no})
-            responses[f"doc {i}"].extend(response) # responses[key] = [[],[]] list of lists
-            page_no += 1
-
-    # # Combine all responses into a single string per document
-    # print("---------Sentences Extraction---------") 
-    # senteces = {}
-    # for key, value in responses.items():
-    #     senteces[key] = ""
-        
-    #     for i in range(len(value)):
-    #         senteces[key] += value[i]
-
-    # # Split the combined responses into a list of sentences per document
-    # sentences_list = {}
-    # for key, value in senteces.items():
-    #     sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+                memory_inside[doc_idx][label] = page_no
+            responses[doc_idx].extend(response)
 
     sentences_list = responses
+    return sentences_list, memory_inside
 
-    return sentences_list,memory_inside
-# ----------------------------------------------------------------------------
-# 1.4.1 Make Labels -> AGENTIC
-# ----------------------------------------------------------------------------
-def agentic_label_creation(all_docs_splits,deep_level = "high") -> dict:
+
+def agentic_label_creation(
+    all_docs: List[List[Document]],
+) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, int]]]:
     """
-    STILL DEVELOPMENT ----------------->
+    Agentic semantic label creation for document pages/chunks.
+
+    Args:
+        all_docs (List[List[Document]]): Nested list of LangChain Document objects.
+            Each sublist corresponds to a document and contains page-level Document objects.
+
+    Returns:
+        sentences_list (Dict[str, List[str]]): Extracted labels for each document/page.
+        memory_inside (Dict[str, Dict[str, int]]): Maps each label to its page index.
+
+    Notes:
+        - Uses structured LLM output via Pydantic BaseModel.
+        - Labels are high-level semantic concepts per page.
     """
 
+    # Semantic labeling instructions
     semantic_labeling_prompt = """
-    You are a semantic labeling agent. Your task is to generate 1–3 high-level, generalized labels for the given text that:
-    - Capture the key entities or concepts and their roles/actions, without relying on exact names, dates, or numbers.
-    - Focus on the semantics: what is happening, what roles exist, and what attributes or outcomes are important.
-    - Preserve important relationships or statuses 
-    - Ensure the labels are concise, consistent, and abstract enough to match similar content in other contexts even if names, numbers, or dates differ.
-    - Do NOT omit critical conceptual information.
-    - Output only the labels as a numbered list.
+    You are a semantic labeling agent. Generate 1–3 high-level labels:
+    - Capture key entities, roles, and actions, without relying on exact names, dates, or numbers.
+    - Focus on semantics and relationships.
+    - Labels must be concise and abstract enough to match similar content elsewhere.
+    - Output only the list of LABELS (no explanations).
     """
 
-    chunk_summary = """
-    You are the steward of a group of chunks, where each chunk represents a document we walkthrough
-    Generate a very brief, 1 to 2,3-sentence summary that explains what the chunk  is about.
-    The summary should:
-    - Capture the main topic or concept of the chunk .
-    - Include any clarifying instructions for what to add or consider in the chunk.
-    - Be generalizable, so similar content in other contexts can be recognized.
-    Only respond with the new chunk summary, nothing else.
-    """
+    # Structured output schema
+    class Classification(BaseModel):
+        response: List[str] = Field(description=semantic_labeling_prompt)
 
-    # Create a chat prompt template to compare two contexts
+    structured_llm = llm.with_structured_output(Classification)
+
+    # Prepare tagging prompt template
     tagging_prompt = ChatPromptTemplate.from_template("""
-    You are given a chunk of  a whole pdf document. Your task is to:
-    Logically think about the desired information from the following passage.
-    Only think about the properties mentioned in the 'Classification' function.
+    You are given a chunk/page of a PDF document.
+    Task:
+    - Identify high-level semantic labels representing this page's content.
+    - Output only the list of LABELS.
 
     Passage:
-    Context 1:
     {context1}
-
     """)
 
-    # Define the structured output schema
-    class Classification(BaseModel):
-        chunks: List[str] = Field(
-            description= semantic_labeling_prompt
-        )
-        summarization: str = Field(
-            description=chunk_summary
-        )
+    # --- Step 1: Extract page content from Document objects ---
+    pages: Dict[str, List[str]] = {}
+    for doc_idx, doc in enumerate(all_docs):
+        pages[f"doc {doc_idx}"] = [page.page_content for page in doc]
 
-    # Wrap LLM with structured output
-    structured_llm = llm.with_structured_output(Classification)
+    # --- Step 2: Process each page and collect labels ---
+    responses: Dict[str, List[str]] = {}
+    memory_inside: Dict[str, Dict[str, int]] = {}
 
-    #deep_level = "high"
-    sys_msg = build_system_message(deep_level)
+    print("---------Agentic Label Extraction---------")
+    for doc_idx, page_texts in pages.items():
+        responses[doc_idx] = []
+        memory_inside[doc_idx] = {}
+        total_pages = len(page_texts)
 
-    # Extract responses (headings) for each page using LLM
-    print("---------Responses Extraction---------")
-    responses = {}
-    for key,value in all_docs_splits.items():
-        responses[key] = []
-        for chunk in value[:]:
-            prompt = f"""
-            You need to understand the content of this page: {chunk}
+        for page_no, page_text in enumerate(page_texts):
+            # Format page text into prompt
+            prompt = tagging_prompt.invoke({"context1": page_text})
 
-            Think about what aspects could differ if the same topic appeared in another similar document.
-            Based only on this page and your careful understanding, identify the **LABELS** that describe possible differences to check. Make the LABELS more detailed.
-            List **only** the LABELS, without any explanations or details.
-            """
-            system_message =  SystemMessage(content=sys_msg)
-            human_message = HumanMessage(content=prompt)
-            prompt = tagging_prompt.invoke({"context1": chunk})
-            response =  structured_llm.invoke(prompt)
-            responses[key].append(response.chunks)
+            # LLM call
+            response = structured_llm.invoke(prompt)
 
-    # Combine all responses into a single string per document
-    print("---------Sentences Extraction---------")
-    senteces = {}
-    for key, value in responses.items():
-        senteces[key] = ""
-        for i in range(len(value)):
-            senteces[key] += value[i]
+            # Debugging
+            print(page_text)
+            print(f"Loading {page_no+1}/{total_pages} in {doc_idx}...")
+            print("*" * 100)
+            print(response.response)
 
-    # Split the combined responses into a list of sentences per document
-    sentences_list = {}
-    for key, value in senteces.items():
-        sentences_list[key] = [line for line in value.split("\n") if line.strip()]
+            # Update memory mapping and responses
+            for label in response.response:
+                memory_inside[doc_idx][label] = page_no
+            responses[doc_idx].extend(response.response)
 
-    return sentences_list
+    sentences_list = responses
+    return sentences_list, memory_inside
+
+
+##############################################################
+# 4. LABEL MAPPING / SIMILARITY
+############################################################### 
 
 # ----------------------------------------------------------------------------
-# 1.5 Extract the Mapping labels
+# 4.1 Map Labels Between Documents
 # ----------------------------------------------------------------------------
-def mapping_labels(labels,threshold=0.5,k=3):
+def mapping_labels(labels: dict, threshold: float = 0.5, k: int = 3, similarity_model: str = "all-MiniLM-L6-v2"):
     """
-    Input:
-        labels: dict  
-            Format: {doc 1: [label1, label2, ..., labeln], doc 2: [label1, label2, ..., labelm]}
-    Output:
-        embeddings: dict  
-            Format: {doc 1: [embed1, embed2, ..., embedn], doc 2: [embed1, embed2, ..., embedm]}  
-            Note: embed1 -> [num1, num2, ..., numd] (d-dimensional vector)
-        comparing_headings: list  
-            Format: [[doc0_label1, doc1_label1], [doc0_label2, doc1_label2], ...]
-    """
+    Map labels between two documents based on semantic similarity.
 
-    # Create embeddings for each label
+    Args:
+        labels (dict): Format: 
+            {
+                "doc 0": [label1, label2, ..., labeln],
+                "doc 1": [label1, label2, ..., labelm]
+            }
+        threshold (float, optional): Minimum similarity score to consider a match. Defaults to 0.5.
+        k (int, optional): Number of top matches per label. Defaults to 3.
+
+    Returns:
+        comparing_headings (list[list[str]]): List of top matched label pairs:
+            [[doc0_label1, doc1_label1], [doc0_label2, doc1_label2], ...]
+    """
     print("---------Embedding Creation---------")
     embeddings = {}
-    for key, value in labels.items():
-        embeddings[key] = []
-        for i in range(len(value)):
-            embeddings[key].append(embedding_model.embed_query(value[i]))
 
-    # Compute similarities between document embeddings
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    similarities = model.similarity(embeddings["doc 0"], embeddings["doc 1"])  # nxm similarity matrix
+    # Generate embeddings for each label
+    for doc_key, label_list in labels.items():
+        embeddings[doc_key] = [embedding_model.embed_query(label) for label in label_list]
 
-    # Get top k matches per row based on similarity
+    # Convert to tensors for similarity calculation
+    embeddings_0 = torch.tensor(embeddings["doc 0"])
+    embeddings_1 = torch.tensor(embeddings["doc 1"])
+
+    # Compute similarity matrix using cosine similarity
+    model = SentenceTransformer(similarity_model)
+    similarities = model.similarity(embeddings_0, embeddings_1)  # nxm similarity matrix
+
+    # Get top-k matches for each label
+    values, indices = torch.topk(similarities, k=k, dim=1)  # values: scores, indices: positions
+    values = values.tolist()
+    indices = indices.tolist()
+
     comparing_headings = []
-    t = threshold # similarity threshold
-    values, indices = torch.topk(similarities, k=k, dim=1)  
-    # values: highest similarity scores, indices: corresponding indices
-    indices = indices.tolist()  # [[i00, i01, i02], [i10, i11, i12], ...]
-    values = values.tolist()    # [[v00, v01, v02], [v10, v11, v12], ...]
-
-    # NUM_OF_LABELS_SELECTED_FOR_EACH NOT ACTIVELY FUNCTION YET  
-    for i in range(len(indices)):
-        # Skip if the top similarity score is below threshold
-        if values[i][0] < t:
+    for i, row_values in enumerate(values):
+        # Skip if highest similarity is below threshold
+        if row_values[0] < threshold:
             continue
 
-        # Print matched labels
-        print(labels["doc 0"][i])
-        print(labels["doc 1"][indices[i][0]])
-        comparing_headings.append([labels["doc 0"][i], labels["doc 1"][indices[i][0]]])
+        top_index = indices[i][0]
+        comparing_headings.append([labels["doc 0"][i], labels["doc 1"][top_index]])
+
+        # Debugging output
+        print(f"{labels['doc 0'][i]} -> {labels['doc 1'][top_index]}")
         print('-' * 50)
 
-    print(f"---------Comparing Headings Creation {len(comparing_headings)}---------")
+    print(f"---------Comparing Headings Created: {len(comparing_headings)}---------")
     return comparing_headings
 
+
+##############################################################
+# 5. CONTRADICTION DETECTION
+##############################################################
+
+# 5.1 LLM-based Comparison of Two Texts
 # ----------------------------------------------------------------------------
-# 1.6 Structured LLM to generate the response
-# ----------------------------------------------------------------------------
-def labelized_llm(context1, context2):
+def labelized_llm(context1: str, context2: str):
     """
-    Input:
-        context1 : str  
-            Text from the first source.
-        context2 : str  
-            Text from the second source.
-    Output:
-        response : BaseModel  
-            Contains structured output:
-                - contradiction_result: str  
-                    Indicates if there are any contradictions between the two contexts.
-                - reason: str  
-                    Explains the reason behind the contradiction (only if a contradiction exists).
+    Compare two text contexts using an LLM and identify contradictions.
+
+    Args:
+        context1 (str): Text from the first source.
+        context2 (str): Text from the second source.
+
+    Returns:
+        BaseModel: Structured output containing:
+            - contradiction_result (str): 'CONTRADICTION' or 'NO CONTRADICTION'.
+            - reason (Optional[str]): Explanation if a contradiction exists.
+    
+    Example:
+        >>> response = labelized_llm("Alice likes apples.", "Alice hates apples.")
+        >>> response.contradiction_result
+        'CONTRADICTION'
     """
 
-    # Create a chat prompt template to compare two contexts
+    # Define a chat prompt template for LLM comparison
     tagging_prompt = ChatPromptTemplate.from_template("""
-    You are given two contexts from different sources.
-    Logically think about the desired information from the following passage.
-    Only think about the properties mentioned in the 'Classification' function.
-    
+    You are an expert analyst tasked with detecting contradictions between two contexts. 
+    Carefully and logically analyze the information in both contexts. Focus **only** on the properties defined in the 'Classification' schema.
+
+    Instructions:
+    1. Compare Context 1 and Context 2 thoroughly.
+    2. Consider only the context related to the context 1 within the context2 for the unrelated contexts just ignore
+    2. Identify if there are any contradictions between the two contexts.
+    3. Consider subtle logical conflicts, opposing statements, or reversed conditions.
+    4. Ignore information not relevant to the properties being compared.
+    5. Be precise and concise in your reasoning.
+
     Passage:
     Context 1:
     {context1}
 
     Context 2:
     {context2}
+
+    Output Format:
+    - CONTRADICTION if any direct logical conflict exists.
+    - NO CONTRADICTION if the statements are consistent or if differences do not constitute a conflict.
+    - If CONTRADICTION, provide a brief reason explaining the conflict.
     """)
 
-    # Define the structured output schema
+    # Define the structured output schema for the LLM
     class Classification(BaseModel):
         contradiction_result: str = Field(
-            description="Are there any contradictions between the two contexts. Must be 'CONTRADICTION' or 'NO CONTRADICTION'."
+            description="Are there any contradictions between Context 1 and Context 2? Must be either 'CONTRADICTION' or 'NO CONTRADICTION'."
         )
         reason: Optional[str] = Field(
             default=None,
-            description="Only provide a reason if there is a contradiction."
+            description="Provide a brief reason only if there is a CONTRADICTION."
         )
 
-    # Wrap LLM with structured output
+    # Wrap LLM to enforce structured output
     structured_llm = llm.with_structured_output(Classification)
 
-    # Invoke the prompt with the provided contexts
+    # Format the prompt with the provided contexts
     prompt = tagging_prompt.invoke({"context1": context1, "context2": context2})
+
+    # Call the LLM and get the structured response
     response = structured_llm.invoke(prompt)
 
+    # Optional: print response for debugging
     print(response)
+
     return response
 
-# Retrieve top-k relevant documents for a pair of labels
-def get_topk_docs(pair, k=5,data=None,memory=None,type_is=None,retrievers=None):
+##############################################################
+# 6. CONTEXT RETRIEVAL
+##############################################################
 
-   
-    # pair = [label_doc1, label_doc2]
-    # Restrict type_is to only two allowed values
-    allowed_types = ["sementic_search", "label_bind", "both"]
+# ----------------------------------------------------------------------------
+# 6.1 Retrieve Top-K Relevant Documents
+# ----------------------------------------------------------------------------
+def get_topk_docs(
+        pair: list,
+        k: int = 5,
+        data: list = None,
+        memory: dict = None,
+        type_is: str = None,
+        retrievers: dict = None
+    ):
+    """
+    Retrieve top-k relevant documents for a given pair of labels.
 
-     # Function to format document pages as a single string
+    Depending on the selected retrieval type, this function fetches documents from
+    either retrievers (semantic search), memory-based bindings (label binding), or both.
+
+    Args:
+        pair (list[str]): A list of two label strings, e.g., [label_doc1, label_doc2].
+        k (int, optional): Number of top relevant documents to retrieve. Defaults to 5.
+        data (list[list[Document]], optional): Nested list of Document objects.
+            Used when `type_is` is "label_bind" or "both".
+        memory (dict, optional): Dictionary mapping document labels to indices
+            within `data`, e.g., memory['doc 0'][label_doc1] -> index.
+        type_is (str): Retrieval mode. Must be one of:
+            ["semantic_search", "label_bind", "both"].
+        retrievers (dict, optional): Dictionary containing retriever objects for
+            "doc 0" and "doc 1". Required if using "semantic_search" or "both".
+
+    Returns:
+        tuple: (docs1, docs2)
+            Each is a list of Document objects corresponding to the input pair.
+        tuple: (docs1_f, docs2_f)
+            Each is a string containing the combined text from the retrieved documents
+            corresponding to each label in the input pair.
+
+    """
+    # Define allowed modes
+    allowed_types = ["semantic_search", "label_bind", "both"]
+
+    # Helper to join multiple pages into a single string
     format_docs = lambda docs: "\n\n".join([d.page_content for d in docs])
 
-    if type_is.lower() not in allowed_types:
+    # Validate mode
+    if type_is is None or type_is.lower() not in allowed_types:
         raise ValueError(f"type_is must be one of {allowed_types}, got '{type_is}'")
 
-    if type_is == "sementic_search":
+    type_is = type_is.lower()
+
+    # --- Case 1: Semantic search retrieval ---
+    if type_is == "semantic_search":
         docs1 = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
         docs2 = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
-        docs1_f = format_docs(docs1)
-        docs2_f = format_docs(docs2)
+        docs1_f, docs2_f = format_docs(docs1), format_docs(docs2)
+
+    # --- Case 2: Label binding retrieval ---
     elif type_is == "label_bind":
-        # some other logic for type2
-        docs1 = data[0][memory['doc 0'][pair[0]]]
-        docs2 = data[1][memory['doc 1'][pair[1]]]
-        docs1_f = docs1.page_content
-        docs2_f = docs2.page_content
+        docs1 = [data[0][memory["doc 0"][pair[0]]]]
+        docs2 = [data[1][memory["doc 1"][pair[1]]]]
+        docs1_f, docs2_f = docs1[0].page_content, docs2[0].page_content
+
+    # --- Case 3: Combined retrieval ---
     elif type_is == "both":
-        # some other logic for type2
-        docs1_sementic = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
-        docs2_sementic = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
-        docs1_f_sementic = format_docs(docs1)
-        docs2_f_sementic = format_docs(docs2)
+        # Retrieve from semantic search
+        docs1_sem = retrievers["doc 0"].get_relevant_documents(pair[0], k=k)
+        docs2_sem = retrievers["doc 1"].get_relevant_documents(pair[1], k=k)
 
-        docs1_label_bind = data[0][memory['doc 0'][pair[0]]]
-        docs2_label_bind = data[1][memory['doc 1'][pair[1]]]
-        docs1_f_label_bind = docs1.page_content
-        docs2_f_label_bind = docs2.page_content
+        # Retrieve from label binding
+        docs1_lbl = [data[0][memory["doc 0"][pair[0]]]]
+        docs2_lbl = [data[1][memory["doc 1"][pair[1]]]]
 
-        docs1_f = docs1_f_sementic + docs1_f_label_bind
-        docs2_f = docs2_f_sementic + docs2_f_label_bind
+        # Merge text representations
+        docs1_f = format_docs(docs1_sem) + "\n\n" + docs1_lbl[0].page_content
+        docs2_f = format_docs(docs2_sem) + "\n\n" + docs2_lbl[0].page_content
 
-    return docs1, docs2
+        # Merge document lists for consistency
+        docs1 = docs1_sem + docs1_lbl
+        docs2 = docs2_sem + docs2_lbl
 
-def make_alldocs_as_document_object(extracted_file_contents, page_size=500):
+    return docs1_f, docs2_f
+
+
+
+##############################################################
+# 7. FILE PROCESSING
+##############################################################
+
+# ----------------------------------------------------------------------------
+# 7.1 Convert Raw Text to Document Objects
+# ----------------------------------------------------------------------------
+def make_alldocs_as_document_object(
+        extracted_file_contents: list,
+        page_size: int = 1000
+    ) -> list:
     """
-        extracted_file_contents = [[fileid,filename,filecontent]]
+    Convert raw Text contents into structured Document objects, simulating page-level segmentation.
+
+    Args:
+        extracted_file_contents (list[list]): A list of files, where each file entry is:
+            [file_id, filename, file_content].
+        page_size (int, optional): The character length used to split each file's content into
+            pseudo-pages. Defaults to 1000.
+
+    Returns:
+        list[list[Document]]: A list of lists, where each sublist corresponds to one file.
+                              Each file contains a list of page-level `Document` objects with metadata.
+
+    Notes:
+        - Designed to produce a consistent structure with get_files_from_local_dir_pypdf().
     """
-    print("make_alldocs_as_document_object")
+    print(f"Making Document Object Of Size {page_size}...")
     all_docs = []
-    for file_content in extracted_file_contents:
-        print("file processing: ",file_content[:2]) # file name and id
 
-    for file_content in extracted_file_contents:
-        file_content = file_content[2] # just to extract the content
-        doc_pages = [Document(
-            page_content=file_content[i:i+page_size],
-            metadata={"source": "user_input", "length": page_size}
-        ) for i in range(0, len(file_content), page_size)]
+    # Process each extracted file
+    for file_entry in extracted_file_contents:
+        # Expect each entry to contain [file_id, filename, file_content]
+        if len(file_entry) < 3:
+            print("!Skipping invalid entry:", file_entry)
+            continue
+
+        file_id, filename, file_content = file_entry[:3]
+        print(f"Processing file: {filename} (ID: {file_id})")
+
+        # Split file content into fixed-size chunks (simulating pages)
+        doc_pages = [
+            Document(
+                page_content=file_content[i:i + page_size],
+                metadata={"source": "user_input", "file_id": file_id, "filename": filename, "length": page_size}
+            )
+            for i in range(0, len(file_content), page_size)
+        ]
+
+        # Append list of page documents for this file
         all_docs.append(doc_pages)
+
     return all_docs
 
-def get_files_from_local_dir_pypdf(folder_path="/home/tharaka/thakshana/doc_comparison/data"):
+
+# ----------------------------------------------------------------------------
+# 7.2 Load PDF Files from Local Directory
+# ----------------------------------------------------------------------------
+def get_files_from_local_dir_pypdf(folder_path: str = "/home/tharaka/thakshana/doc_comparison/data") -> list:
+    """
+    Load all PDF files from a local directory and return their page-level Document objects.
+
+    Args:
+        folder_path (str): Absolute or relative path to the directory containing PDF files.
+                           Defaults to "/home/tharaka/thakshana/doc_comparison/data".
+
+    Returns:
+        list[list[Document]]: A list of documents, where each element corresponds to one PDF file.
+                              Each PDF file is represented as a list of `Document` objects 
+                              (one per page, as returned by `PyPDFLoader.load()`).
+    Notes:
+        - Only files with the `.pdf` extension are processed.
+        - Each PDF is loaded using `PyPDFLoader` from LangChain.
+    """
     all_docs = []
+
+    # Iterate through all files in the specified folder
     for filename in os.listdir(folder_path):
+        # Process only PDF files
         if filename.endswith(".pdf"):
-            loader = PyPDFLoader(os.path.join(folder_path, filename))
+            file_path = os.path.join(folder_path, filename)
+
+            # Initialize PyPDFLoader for the current file
+            loader = PyPDFLoader(file_path)
+
+            # Load document pages as a list of Document objects
             docs = loader.load()
-            all_docs.append(docs)  # append all pages to the main list
+
+            # Append the list of pages for this PDF to the main result
+            all_docs.append(docs)
+
     return all_docs
+
 
     
-# ----------------------------------------------------------------------------
-# 1.7 Main comparison function
-# ----------------------------------------------------------------------------
+##############################################################
+# 8. Main Comparison Function
+##############################################################
 def compare_documents(extracted_file_contents: list):
     """
     Input:
@@ -824,9 +1048,6 @@ def compare_documents(extracted_file_contents: list):
         output : str
             Concatenated reasons for contradictions detected between document pairs.
     """
-
-    
-
     print("---------STARTED---------")
     file_names_processing = []
     for file_content in extracted_file_contents:
@@ -856,11 +1077,15 @@ def compare_documents(extracted_file_contents: list):
     print("---------Label Creation---------")
     # Extract labels/sentences from documents
    
-   # labels = label_creation(all_docs)  # sentences_list: dict {doc 1:[sentence1,...], doc 2:[sentence1,...]}
+   # labels = agentic_label_creation(all_docs)  # sentences_list: dict {doc 1:[sentence1,...], doc 2:[sentence1,...]}
 
     #labels,memory = label_creation_with_memory(all_docs,DEEP_LEVEL) 
-
+    all_docs_agentic_chunking = []
+    for key,value in all_docs_splits.items():
+        all_docs_agentic_chunking.append(value)
+    all_docs = all_docs_agentic_chunking
     labels,memory = NO_LLM_label_creation_with_memory(all_docs)
+
     l1 = len(labels["doc 1"])
     l0 = len(labels["doc 0"])
     details = f"Labels created by doc0 {l1}\n Labels created by doc1 {l0}\n"
@@ -886,6 +1111,7 @@ def compare_documents(extracted_file_contents: list):
         
         # Get LLM response for the document pair
         response = labelized_llm(docs1_f, docs2_f)
+        print((docs1_f, docs2_f))
         print(response)
 
         # Append reason to output if a contradiction is found
